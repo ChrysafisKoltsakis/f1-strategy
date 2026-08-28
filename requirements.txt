@@ -9,3 +9,5 @@ jupyter>=1.1.1
 imbalanced-learn>=0.13.0
 pyspark>=4.2.0
 kafka-python-ng>=2.2.3
+fastapi>=0.115
+uvicorn>=0.34

@@ -67,6 +67,7 @@ trained model at data/models/trigger_classifier.joblib (from
 Run with: JAVA_HOME=~/.local/jdk python notebooks/09_streaming_consumer.py <race_id>
 """
 import sys
+import json
 import importlib.util
 from pathlib import Path
 
@@ -80,6 +81,7 @@ KAFKA_BOOTSTRAP = 'localhost:9092'
 TOPIC = 'f1-race-laps'
 LIVE_THRESHOLD = 0.5
 BRONZE_DIR = Path('data/bronze')
+LIVE_EVENTS_DIR = Path('data/live_events')
 
 # Load 05_trigger_classifier.py's feature-building functions directly, so
 # live and offline feature computation can never drift apart.
@@ -105,6 +107,23 @@ LAP_SCHEMA = StructType([
     StructField('track_status', StringType()), StructField('pit_in', BooleanType()),
     StructField('pit_out', BooleanType()),
 ])
+
+
+def make_emitter(race_id: str):
+    """Every event this consumer produces (lap scores, peak flags, risk
+    comparisons) is also written as one JSON line per event to
+    data/live_events/{race_id}.jsonl, alongside the existing print()
+    output -- so dashboard/server.py can tail the same information a
+    terminal user sees, without re-parsing printed strings. Truncates any
+    previous run's file for this race_id. Line-buffered so a tailing
+    reader sees each event promptly, not once Python's buffer fills."""
+    LIVE_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(LIVE_EVENTS_DIR / f"{race_id}.jsonl", 'w', buffering=1)
+
+    def emit(event: dict):
+        f.write(json.dumps(event) + "\n")
+
+    return emit
 
 
 def load_static_context(race_id: str):
@@ -164,7 +183,7 @@ def load_risk_context(race_id: str):
 
 
 def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, age: int,
-                              laps_so_far: pd.DataFrame, n_laps: int, risk_ctx: dict) -> str | None:
+                              laps_so_far: pd.DataFrame, n_laps: int, risk_ctx: dict) -> dict | None:
     """The actual live recommendation: given only laps observed so far,
     what does pitting right now cost versus waiting, and how does the real
     historical chance of another SC/VSC window change that. Same DP
@@ -173,7 +192,11 @@ def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, ag
     argument, and using causal_field_pace_forecast() instead of
     10's own hindsight field-pace lookup. Returns None if this driver's
     current compound was never modeled for this race (too few laps) or a
-    state can't be solved from here (e.g. too few laps remaining)."""
+    state can't be solved from here (e.g. too few laps remaining).
+
+    Returns raw numbers (a dict) rather than a formatted string, so both
+    the terminal print and dashboard/server.py's JSON event can be built
+    from the same values without one having to re-parse the other's text."""
     if compound not in risk_ctx['compounds']:
         return None
     degradation, compounds = risk_ctx['degradation'], risk_ctx['compounds']
@@ -195,10 +218,11 @@ def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, ag
     p_again, n_events = lr.p_another_event(risk_ctx['rec_df'], progress)
     expected_b = p_again * opt_b_best['cost'] + (1 - p_again) * opt_b_worst['cost']
     diff = expected_b - opt_a['cost']
-    verdict = "pit NOW" if diff > 0 else "WAIT"
-    return (f"      -> pit now: {opt_a['cost']:.1f}s total  |  wait, worst case: {opt_b_worst['cost']:.1f}s  |  "
-            f"wait, SC/VSC again (P={p_again*100:.0f}%, n={n_events}): {opt_b_best['cost']:.1f}s  |  "
-            f"wait expected: {expected_b:.1f}s  ==>  {verdict} looks better by {abs(diff):.1f}s on expectation")
+    return {
+        'pit_now_s': opt_a['cost'], 'wait_worst_s': opt_b_worst['cost'], 'wait_best_s': opt_b_best['cost'],
+        'p_again': p_again, 'n_events': n_events, 'expected_wait_s': expected_b, 'diff_s': diff,
+        'verdict': 'pit NOW' if diff > 0 else 'WAIT',
+    }
 
 
 def to_bronze_shape(batch: pd.DataFrame) -> pd.DataFrame:
@@ -222,6 +246,8 @@ def main():
         sys.exit(1)
     race_id = sys.argv[1]
 
+    emit = make_emitter(race_id)
+
     rivals, sc_prob_by_lap, bundle, n_laps, event_name = load_static_context(race_id)
     model, feature_cols, compound_categories = bundle['model'], bundle['feature_cols'], bundle['compound_categories']
     print(f"Loaded model + static context for {race_id} ({event_name}, {n_laps} laps)")
@@ -233,6 +259,11 @@ def main():
     else:
         print(f"Risk/reward context ready: {len(risk_ctx['compounds'])} compounds modeled, "
               f"green pit loss {risk_ctx['green_pit_loss']:.1f}s, SC/VSC pit loss {risk_ctx['sc_pit_loss']:.1f}s\n")
+
+    emit({'type': 'context', 'race_id': race_id, 'event_name': event_name, 'n_laps': n_laps,
+          'compounds_modeled': risk_ctx['compounds'] if risk_ctx else [],
+          'green_pit_loss': risk_ctx['green_pit_loss'] if risk_ctx else None,
+          'sc_pit_loss': risk_ctx['sc_pit_loss'] if risk_ctx else None})
 
     seen_history = {'df': pd.DataFrame()}       # accumulated laps seen so far this race
     last_recommendation_lap = {}                 # driver -> last lap a recommendation fired, resets after a real stop
@@ -283,6 +314,7 @@ def main():
 
         for (_, row), p in scored:
             driver, lap = row['driver'], row['lap']
+            driver_team = laps_so_far.loc[laps_so_far['Driver'] == driver, 'Team'].iloc[-1]
             if row['label_pit']:
                 last_pit_lap[driver] = lap
                 prob_history[driver] = []   # fresh stint, forget the last one's curve
@@ -298,6 +330,7 @@ def main():
             history = prob_history.setdefault(driver, [])
             flag = ""
             already_acted = False
+            peak_lap = peak_proba = None
             if history:
                 prev_lap, prev_p = history[-1]
                 stint_start = last_pit_lap.get(driver, -1)
@@ -319,6 +352,7 @@ def main():
                 # separate, later rise", not how tall either peak was.
                 if prev_p >= LIVE_THRESHOLD and p < prev_p and armed.get(driver, True):
                     flag = f"  <-- peak was lap {prev_lap:.0f} (P={prev_p:.2f}), consider pitting there"
+                    peak_lap, peak_proba = int(prev_lap), float(prev_p)
                     last_recommendation_lap[driver] = lap
                     armed[driver] = False
                     # The flagged peak lap can itself BE the lap the driver
@@ -338,11 +372,19 @@ def main():
                 armed[driver] = True
             history.append((lap, p))
 
+            tyre_age = float(row['own_tyre_age']) if pd.notna(row['own_tyre_age']) else None
+            compound_str = str(row['own_compound']) if pd.notna(row['own_compound']) else None
             print(f"  lap {lap:2.0f}  {driver}  P(pit)={p:.2f}  tyre_age={row['own_tyre_age']:.0f} "
                   f"{row['own_compound']}{flag}")
+            emit({'type': 'lap_score', 'lap': int(lap), 'driver': driver, 'team': str(driver_team),
+                  'proba': float(p), 'tyre_age': tyre_age, 'compound': compound_str})
+            if flag:
+                emit({'type': 'peak_flag', 'lap': int(lap), 'driver': driver,
+                      'peak_lap': peak_lap, 'peak_proba': peak_proba})
 
             if flag and already_acted:
                 print("      (already pitted at the flagged lap -- no live pit-now-vs-wait decision left to evaluate)")
+                emit({'type': 'already_acted', 'lap': int(lap), 'driver': driver, 'peak_lap': peak_lap})
             # A peak alone only says "this looks like where similar drivers
             # have historically pitted" -- it's an imitation-learned
             # behavioral signal, not a cost. Re-solve the actual pit-now-
@@ -351,12 +393,16 @@ def main():
             # printed recommendation carries a real cost/risk number, not
             # just a probability.
             elif flag and risk_ctx is not None and pd.notna(row['own_tyre_age']):
-                team = laps_so_far.loc[laps_so_far['Driver'] == driver, 'Team'].iloc[-1]
-                risk_line = evaluate_pit_now_vs_wait(
-                    driver, team, int(lap), row['own_compound'], int(row['own_tyre_age']),
+                result = evaluate_pit_now_vs_wait(
+                    driver, driver_team, int(lap), row['own_compound'], int(row['own_tyre_age']),
                     laps_so_far, n_laps, risk_ctx)
-                if risk_line:
-                    print(risk_line)
+                if result:
+                    print(f"      -> pit now: {result['pit_now_s']:.1f}s total  |  "
+                          f"wait, worst case: {result['wait_worst_s']:.1f}s  |  "
+                          f"wait, SC/VSC again (P={result['p_again']*100:.0f}%, n={result['n_events']}): "
+                          f"{result['wait_best_s']:.1f}s  |  wait expected: {result['expected_wait_s']:.1f}s  ==>  "
+                          f"{result['verdict']} looks better by {abs(result['diff_s']):.1f}s on expectation")
+                    emit({'type': 'risk_comparison', 'lap': int(lap), 'driver': driver, **result})
 
     spark = SparkSession.builder \
         .appName('f1-streaming-consumer') \
@@ -378,6 +424,7 @@ def main():
 
     query = parsed.writeStream.foreachBatch(process_batch).trigger(processingTime='2 seconds').start()
     print(f"Listening on '{TOPIC}' for race={race_id} -- start 08_streaming_producer.py now.\n")
+    emit({'type': 'ready'})
     query.awaitTermination()
 
 
