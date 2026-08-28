@@ -6,3 +6,6 @@ pyarrow>=25.0.1
 lightgbm>=4.7.0
 scikit-learn>=1.9.0
 jupyter>=1.1.1
+imbalanced-learn>=0.13.0
+pyspark>=4.2.0
+kafka-python-ng>=2.2.3

@@ -39,6 +39,7 @@ Run with: python notebooks/05_trigger_classifier.py
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import joblib
 from pathlib import Path
 from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from imblearn.over_sampling import SMOTENC
@@ -443,6 +444,23 @@ def main():
     test_out.to_csv('data/trigger_classifier_test_predictions.csv', index=False)
     print(f"\nSaved data/silver/trigger_classifier_features.parquet ({len(df)} rows)")
     print(f"Saved data/trigger_classifier_test_predictions.csv ({len(test_out)} rows)")
+
+    # Deployed model: retrained on ALL races (not just the 83-race train
+    # split) with the winning class_weight='balanced' setup, for anything
+    # downstream that needs live predictions (e.g. the streaming layer)
+    # rather than a held-out evaluation. Reported metrics above still
+    # describe the train/test-split version -- this one trades that
+    # evaluation honesty for using all available data in production.
+    final_model = lgb.LGBMClassifier(
+        n_estimators=300, learning_rate=0.05, num_leaves=31,
+        class_weight='balanced', random_state=0, verbosity=-1,
+    )
+    final_model.fit(df[feature_cols], df['label_pit'], categorical_feature=['own_compound'])
+    Path('data/models').mkdir(parents=True, exist_ok=True)
+    joblib.dump({'model': final_model, 'feature_cols': feature_cols,
+                 'compound_categories': df['own_compound'].cat.categories.tolist()},
+                'data/models/trigger_classifier.joblib')
+    print(f"Saved data/models/trigger_classifier.joblib (trained on all {len(df)} rows)")
 
 
 if __name__ == '__main__':
