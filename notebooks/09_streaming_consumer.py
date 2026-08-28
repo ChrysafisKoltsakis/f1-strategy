@@ -196,7 +196,19 @@ def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, ag
 
     Returns raw numbers (a dict) rather than a formatted string, so both
     the terminal print and dashboard/server.py's JSON event can be built
-    from the same values without one having to re-parse the other's text."""
+    from the same values without one having to re-parse the other's text.
+
+    "pit now" only gets priced at the cheap SC/VSC rate when SC/VSC is
+    ACTUALLY active on this lap in the real data -- checked directly,
+    not assumed just because the trigger classifier's probability
+    happened to peak. Found by tracing a specific dashboard case (VER,
+    2025_r20, lap 36): the classifier peaked on an ordinary green-flag
+    pit window (TrackStatus stayed '1' the whole time), but this
+    function unconditionally offered the SC discount anyway, making
+    "pit now" look artificially cheap and flipping the verdict from the
+    correct WAIT to an incorrect pit-NOW. The classifier peak is only
+    ever a behavioral trigger for *when to ask the question* -- it says
+    nothing about whether a cheap window is actually open right now."""
     if compound not in risk_ctx['compounds']:
         return None
     degradation, compounds = risk_ctx['degradation'], risk_ctx['compounds']
@@ -206,8 +218,14 @@ def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, ag
     mask_bit = 1 << compounds.index(compound)
     progress = lap / n_laps
 
+    current_status = laps_so_far.loc[(laps_so_far['Driver'] == driver) & (laps_so_far['LapNumber'] == lap),
+                                      'TrackStatus']
+    sc_active_now = len(current_status) > 0 and lr.dpl._is_sc_or_vsc(str(current_status.iloc[-1]))
+
     opt_a = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
-                                    pit_loss, compounds, discount_price=sc_pit_loss, force_stop_at_start=True)
+                                    pit_loss, compounds,
+                                    discount_price=sc_pit_loss if sc_active_now else None,
+                                    force_stop_at_start=True)
     opt_b_worst = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
                                           pit_loss, compounds)
     opt_b_best = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
@@ -221,7 +239,7 @@ def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, ag
     return {
         'pit_now_s': opt_a['cost'], 'wait_worst_s': opt_b_worst['cost'], 'wait_best_s': opt_b_best['cost'],
         'p_again': p_again, 'n_events': n_events, 'expected_wait_s': expected_b, 'diff_s': diff,
-        'verdict': 'pit NOW' if diff > 0 else 'WAIT',
+        'verdict': 'pit NOW' if diff > 0 else 'WAIT', 'sc_active_now': sc_active_now,
     }
 
 
@@ -397,7 +415,8 @@ def main():
                     driver, driver_team, int(lap), row['own_compound'], int(row['own_tyre_age']),
                     laps_so_far, n_laps, risk_ctx)
                 if result:
-                    print(f"      -> pit now: {result['pit_now_s']:.1f}s total  |  "
+                    discount_note = "SC/VSC active -- discounted" if result['sc_active_now'] else "green flag -- full price"
+                    print(f"      -> pit now ({discount_note}): {result['pit_now_s']:.1f}s total  |  "
                           f"wait, worst case: {result['wait_worst_s']:.1f}s  |  "
                           f"wait, SC/VSC again (P={result['p_again']*100:.0f}%, n={result['n_events']}): "
                           f"{result['wait_best_s']:.1f}s  |  wait expected: {result['expected_wait_s']:.1f}s  ==>  "

@@ -309,7 +309,8 @@ function resolveCard(evt, kind) {
     div.innerHTML += `<br>already pitted at the flagged lap -- no live decision left to evaluate.`;
   } else {
     div.classList.add(evt.verdict === 'pit NOW' ? 'pit-now' : 'wait');
-    div.innerHTML += `<br>pit now: <b>${evt.pit_now_s.toFixed(1)}s</b> &nbsp;|&nbsp; ` +
+    const discountNote = evt.sc_active_now ? 'SC/VSC active -- discounted' : 'green flag -- full price';
+    div.innerHTML += `<br>pit now (${discountNote}): <b>${evt.pit_now_s.toFixed(1)}s</b> &nbsp;|&nbsp; ` +
       `wait (worst): ${evt.wait_worst_s.toFixed(1)}s &nbsp;|&nbsp; ` +
       `wait (SC again, P=${Math.round(evt.p_again*100)}%): ${evt.wait_best_s.toFixed(1)}s &nbsp;|&nbsp; ` +
       `expected wait: ${evt.expected_wait_s.toFixed(1)}s` +
