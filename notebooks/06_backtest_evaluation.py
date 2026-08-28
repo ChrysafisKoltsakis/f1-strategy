@@ -25,7 +25,13 @@ Run with: python notebooks/06_backtest_evaluation.py
 """
 import pandas as pd
 import numpy as np
+import importlib.util
 from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    'degradation_model_lib', Path(__file__).parent / '03_ml_degradation_model.py')
+dm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dm)
 
 BRONZE_DIR = Path('data/bronze')
 STARTING_FUEL_KG = 110
@@ -126,20 +132,47 @@ def replay_strategy(stop_laps: list, start_compound: str, n_laps: int,
                      field_pace: pd.Series, degradation: dict, pit_loss: float):
     """Cost of a given (pit-lap list, compound-choice policy) strategy,
     evaluated through the same expected-pace model as the DP baseline and
-    the actual-strategy replay. At each stop, greedily picks whichever
-    eligible compound minimizes that stint's expected pace, forcing an
-    unused compound first if the two-compound rule isn't satisfied yet."""
+    the actual-strategy replay. At each stop, picks whichever eligible
+    compound minimizes total expected pace over the *whole upcoming
+    stint* (to the next stop, or race end), not just its first lap --
+    stop_laps is fully known upfront, so the stint length at each
+    decision point is knowable in advance. A compound that's fastest at
+    tyre age 1 can still be the wrong choice if it degrades faster over
+    a long stint; comparing only age-1 pace systematically favored
+    whichever compound looks best on lap one regardless of how long it
+    then has to survive, which was quietly costing 2-stop plans more
+    than 1-stop ones (more, and less predictable, stint lengths) --
+    found by comparing the classifier's multi-stop ranking against
+    DP-optimal and seeing it under-call 2-stops even when the ranking's
+    own candidate-lap confidence was high, so the gap had to be in how a
+    chosen plan's cost was computed, not in which laps got proposed.
+    Forces an unused compound first if the two-compound rule isn't
+    satisfied yet."""
     def expected_pace(lap, compound, age):
-        d = degradation.get(compound)
+        pace_lookup = degradation.get(compound)
         fp = field_pace.get(lap)
-        if d is None or fp is None or pd.isna(fp):
+        if pace_lookup is None or fp is None or pd.isna(fp):
             return None
-        return fp + d['relative_intercept'] + d['tyre_age_slope'] * age
+        rel_pace = pace_lookup.get((int(lap), int(age)))
+        if rel_pace is None:
+            return None
+        return fp + rel_pace
+
+    stops_sorted = sorted(stop_laps)
+
+    def stint_end(lap):
+        later = [s for s in stops_sorted if s > lap]
+        return (later[0] - 1) if later else n_laps
 
     def best_compound(used: set, lap: int):
         candidates = [c for c in degradation if c not in used] or list(degradation)
-        scored = [(c, expected_pace(lap, c, 1)) for c in candidates]
-        scored = [(c, p) for c, p in scored if p is not None]
+        end = stint_end(lap)
+        scored = []
+        for c in candidates:
+            paces = [expected_pace(l, c, i + 1) for i, l in enumerate(range(int(lap), int(end) + 1))]
+            if any(p is None for p in paces):
+                continue
+            scored.append((c, sum(paces)))
         if not scored:
             return None
         return min(scored, key=lambda x: x[1])[0]
@@ -176,6 +209,7 @@ def main():
     pred = pd.read_csv('data/trigger_classifier_test_predictions.csv')
     dp = pd.read_csv('data/dp_baseline_backtest.csv')
     deg_df = pd.read_csv('data/degradation_summary.csv')
+    ml_bundle = dm.load_degradation_model()
 
     races = sorted(set(pred['race'].unique()) & set(dp['race'].unique()))
     print(f"3-way backtest over {len(races)} races (test-set races the DP baseline could also solve)\n")
@@ -189,8 +223,11 @@ def main():
         field_pace = compute_field_pace(laps)
 
         race_deg = deg_df[deg_df['race'] == race_id].set_index('compound').to_dict('index')
-        degradation = {c: race_deg[c] for c in DRY_COMPOUNDS
-                        if c in race_deg and race_deg[c]['n_laps'] >= 30}
+        eligible = [c for c in DRY_COMPOUNDS if c in race_deg and race_deg[c]['n_laps'] >= 5]
+        if len(eligible) < 2:
+            continue
+        ml_lookup = dm.build_ml_pace_lookup(race_id, ml_bundle, eligible)
+        degradation = {c: ml_lookup[c] for c in eligible if c in ml_lookup}
         if len(degradation) < 2:
             continue
 

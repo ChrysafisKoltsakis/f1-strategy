@@ -23,11 +23,30 @@ data-derived scenarios (not a full Monte Carlo simulation).
 
 Run with: python notebooks/10_live_risk_comparison.py <race_id> <lap>
   e.g.    python notebooks/10_live_risk_comparison.py 2023_r08 8
+
+09_streaming_consumer.py also imports this module directly (dynamic
+import, same pattern as everywhere else in this project) to run this same
+pit-now-vs-wait comparison live, off only the laps observed so far in the
+stream, whenever its peak detector flags a candidate lap -- see
+causal_field_pace_forecast() below for the one piece that had to change
+for that (main()'s field-pace lookup uses real historical future laps,
+which a live decision can't do).
 """
 import sys
 import pandas as pd
 import numpy as np
+import importlib.util
 from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    'degradation_model_lib', Path(__file__).parent / '03_ml_degradation_model.py')
+dm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dm)
+
+_spec2 = importlib.util.spec_from_file_location(
+    'degradation_pitloss_lib', Path(__file__).parent / '02_fixed_degradation_pitloss.py')
+dpl = importlib.util.module_from_spec(_spec2)
+_spec2.loader.exec_module(dpl)
 
 BRONZE_DIR = Path('data/bronze')
 STARTING_FUEL_KG = 110
@@ -115,6 +134,37 @@ def p_another_event(rec_df: pd.DataFrame, current_progress: float) -> float:
     return window['had_another_later'].mean(), len(window)
 
 
+def causal_field_pace_forecast(laps_so_far: pd.DataFrame, n_laps: int) -> pd.Series:
+    """Live-safe field-pace baseline, for use by the streaming consumer
+    (09_streaming_consumer.py) instead of main()'s hindsight version above.
+    main() reads the real historical field pace for the WHOLE race,
+    including laps that haven't happened yet from a live decision's point
+    of view -- fine for validating the tool against known history (its
+    original purpose), not fine for an actual live call, since it would
+    silently bake in whether a real future SC/rain event happened.
+
+    Laps already seen use their real observed field pace. Laps not yet
+    seen are held flat at the recent green-flag median -- i.e. "assume
+    conditions continue as they've been," which is the honest, causal
+    definition of "no more incident," and matches what solve_dp_from_state's
+    non-discounted branch is supposed to represent. The *chance* of a
+    future incident is priced separately, via p_another_event()'s
+    historical recurrence rate and the discounted stop price -- not by
+    projecting a specific future pace-spike shape, which a live system
+    can't know in advance."""
+    laps_so_far = laps_so_far.copy()
+    laps_so_far['TrackStatus'] = laps_so_far['TrackStatus'].astype(str)
+    observed = compute_field_pace(laps_so_far)
+    green = laps_so_far[~laps_so_far['TrackStatus'].apply(dpl._is_sc_or_vsc)]
+    green_pace = compute_field_pace(green)
+    flat_level = green_pace.tail(5).median() if len(green_pace) else observed.tail(5).median()
+
+    last_lap = int(laps_so_far['LapNumber'].max())
+    forecast = observed.reindex(range(1, n_laps + 1))
+    forecast.loc[forecast.index > last_lap] = flat_level
+    return forecast.rename('FieldPace')
+
+
 def solve_dp_from_state(n_laps: int, field_pace: pd.Series, degradation: dict,
                          start_lap: int, start_compound: str, start_age: int, start_mask: int,
                          pit_loss: float, compounds: list, min_total_compounds: int = 2,
@@ -131,11 +181,14 @@ def solve_dp_from_state(n_laps: int, field_pace: pd.Series, degradation: dict,
     the SC right now" rather than "a discount becomes available at some
     point, whenever the optimizer prefers."""
     def expected_pace(lap, compound, age):
-        d = degradation.get(compound)
+        pace_lookup = degradation.get(compound)
         fp = field_pace.get(lap)
-        if d is None or fp is None or pd.isna(fp):
+        if pace_lookup is None or fp is None or pd.isna(fp):
             return None
-        return fp + d['relative_intercept'] + d['tyre_age_slope'] * age
+        rel_pace = pace_lookup.get((int(lap), int(age)))
+        if rel_pace is None:
+            return None
+        return fp + rel_pace
 
     def bit(c):
         return 1 << compounds.index(c)
@@ -196,7 +249,10 @@ def main():
 
     deg_df = pd.read_csv('data/degradation_summary.csv')
     race_deg = deg_df[deg_df['race'] == race_id].set_index('compound').to_dict('index')
-    degradation = {c: race_deg[c] for c in DRY_COMPOUNDS if c in race_deg and race_deg[c]['n_laps'] >= 30}
+    eligible = [c for c in DRY_COMPOUNDS if c in race_deg and race_deg[c]['n_laps'] >= 5]
+    ml_bundle = dm.load_degradation_model()
+    ml_lookup = dm.build_ml_pace_lookup(race_id, ml_bundle, eligible)
+    degradation = {c: ml_lookup[c] for c in eligible if c in ml_lookup}
     compounds = list(degradation.keys())
 
     green_pit_loss = float(pd.read_csv('data/pit_loss_summary.csv').set_index('race')['median_pit_loss'][race_id])

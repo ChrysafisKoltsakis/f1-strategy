@@ -23,6 +23,7 @@ Run: python notebooks/03_ml_degradation_model.py
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import joblib
 from pathlib import Path
 from sklearn.metrics import mean_absolute_error
 
@@ -189,6 +190,82 @@ def extract_degradation_curves(model, feature_cols, silver: pd.DataFrame):
     return pd.DataFrame(rows).sort_values(['circuit', 'compound'])
 
 
+MAX_AGE_GRID = 60  # laps -- covers any plausible single-stint length
+
+
+def load_degradation_model():
+    """Loads the persisted model bundle -- shared by 04_dp_baseline.py,
+    06_backtest_evaluation.py, and 10_live_risk_comparison.py, which
+    import this function dynamically (notebook filenames start with a
+    digit and can't be `import`ed as normal Python modules -- same
+    pattern 09_streaming_consumer.py already uses to reuse
+    05_trigger_classifier.py's feature-building code)."""
+    return joblib.load('data/models/degradation_model.joblib')
+
+
+def build_ml_pace_lookup(race_id: str, bundle: dict, compounds: list) -> dict:
+    """Precomputes predicted RelativePace for every (compound, lap, tyre
+    age) combination that could plausibly occur in this race, in ONE
+    batched model.predict() call, returning a
+    {compound: {(lap, age): relative_pace}} lookup. A dynamic-programming
+    search (or a backtest replaying many candidate strategies) needs this
+    at thousands of individual states -- querying the model call-by-call
+    would be far slower than one batch prediction over the full grid.
+
+    Uses the race's own real historical weather (matching what the model
+    was trained on) rather than a fixed/assumed value -- legitimate for
+    replaying a historical race, same principle already used for
+    FieldPace elsewhere in this codebase. Stint number, which the model
+    was also trained on, is not knowable in advance for a hypothetical
+    strategy still being evaluated, so it's held at each race's own
+    observed median stint (the same partial-dependence-style
+    simplification extract_degradation_curves() already uses for
+    circuit-level curves, just applied per-race here instead)."""
+    model, feature_cols = bundle['model'], bundle['feature_cols']
+    compound_categories, event_categories = bundle['compound_categories'], bundle['event_categories']
+
+    laps = pd.read_parquet(BRONZE_DIR / f"{race_id}_laps.parquet")
+    n_laps = int(laps['LapNumber'].max())
+    event_name = laps['EventName'].iloc[0]
+    median_stint = laps['Stint'].median() if laps['Stint'].notna().any() else 1.0
+
+    weather = pd.read_parquet(BRONZE_DIR / f"{race_id}_weather.parquet").sort_values('Time')
+    lap_times = laps.sort_values('Time')[['Time', 'LapNumber']].drop_duplicates('LapNumber')
+    lap_weather = pd.merge_asof(lap_times, weather[['Time', 'AirTemp', 'TrackTemp', 'Humidity', 'Rainfall']],
+                                 on='Time', direction='nearest').set_index('LapNumber')
+
+    valid_compounds = [c for c in compounds if c in compound_categories]
+    if event_name not in event_categories:
+        return {}  # circuit never seen in training -- caller should fall back
+
+    grid_rows = []
+    for compound in valid_compounds:
+        for lap in range(1, n_laps + 1):
+            if lap not in lap_weather.index:
+                continue
+            w = lap_weather.loc[lap]
+            for age in range(1, MAX_AGE_GRID + 1):
+                grid_rows.append({
+                    'lap': lap, 'compound': compound, 'age': age,
+                    'TyreLife': age, 'RaceProgress': lap / n_laps,
+                    'AirTemp': w['AirTemp'], 'TrackTemp': w['TrackTemp'],
+                    'Humidity': w['Humidity'], 'Rainfall': w['Rainfall'],
+                    'Stint': median_stint,
+                })
+    if not grid_rows:
+        return {}
+
+    grid = pd.DataFrame(grid_rows)
+    grid['Compound'] = pd.Categorical(grid['compound'], categories=compound_categories)
+    grid['EventName'] = pd.Categorical([event_name] * len(grid), categories=event_categories)
+    preds = model.predict(grid[feature_cols])
+
+    lookup = {c: {} for c in valid_compounds}
+    for (lap, compound, age), pred in zip(zip(grid['lap'], grid['compound'], grid['age']), preds):
+        lookup[compound][(lap, age)] = float(pred)
+    return lookup
+
+
 def main():
     print("Building Silver-layer ML feature dataset from all cached races...")
     silver = build_silver_dataset()
@@ -202,6 +279,20 @@ def main():
     curves.to_csv('data/ml_degradation_curves.csv', index=False)
     print(curves.to_string(index=False))
     print(f"\nSaved data/ml_degradation_curves.csv ({len(curves)} rows)")
+
+    # Persist the trained model itself, not just the extracted summary
+    # curves -- 04_dp_baseline.py, 06_backtest_evaluation.py, and
+    # 10_live_risk_comparison.py need to query it directly (tyre_age x
+    # compound x lap, for an arbitrary hypothetical strategy), which the
+    # summary CSV's fixed per-circuit slope/two-point snapshot can't
+    # support.
+    Path('data/models').mkdir(parents=True, exist_ok=True)
+    joblib.dump({
+        'model': model, 'feature_cols': feature_cols,
+        'compound_categories': silver['Compound'].cat.categories.tolist(),
+        'event_categories': silver['EventName'].cat.categories.tolist(),
+    }, 'data/models/degradation_model.joblib')
+    print("Saved data/models/degradation_model.joblib")
 
 
 if __name__ == '__main__':

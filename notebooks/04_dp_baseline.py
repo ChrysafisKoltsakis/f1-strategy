@@ -11,14 +11,24 @@ age, set of compounds used so far), transition each lap = stay out vs. pit
 into another compound, objective = minimize total race time subject to
 using at least two distinct compounds (the mandatory two-compound rule).
 
-Reuses the Gold-layer degradation curves and green pit-loss constants
-already computed by 02_fixed_degradation_pitloss.py (data/degradation_summary.csv,
-data/pit_loss_summary.csv), plus per-lap FieldPace recomputed from Bronze
-laps -- the same lap-time model the pit-loss/degradation pipeline uses.
-Each driver's *actual* strategy is replayed through this same model (not
-their real recorded lap times), so the comparison isolates "was the
-strategy choice good" from "was the driving good" -- actual-strategy cost
-and DP-optimal cost are both estimates under the identical model.
+Degradation now comes from the trained ML model (03_ml_degradation_model.py's
+LightGBM, loaded dynamically since notebook filenames can't be `import`ed
+normally), not the per-race linear regression this file originally used --
+that per-race-only fit couldn't capture non-linear/cliff wear and had to
+be refit independently for every race with no pooling. The ML model pools
+across all 103 races/circuits (leave-one-circuit-out validated,
+~0.72s MAE) and is queried via a precomputed per-race (compound, lap,
+tyre age) grid -- build_ml_pace_lookup() in 03 -- rather than per-state
+model.predict() calls, since the DP explores thousands of states. Uses
+the race's own real historical weather (legitimate for replaying a
+historical race, same principle FieldPace itself already relies on).
+Green pit-loss constants still come from 02_fixed_degradation_pitloss.py
+(data/pit_loss_summary.csv), plus per-lap FieldPace recomputed from
+Bronze laps. Each driver's *actual* strategy is replayed through this
+same model (not their real recorded lap times), so the comparison
+isolates "was the strategy choice good" from "was the driving good" --
+actual-strategy cost and DP-optimal cost are both estimates under the
+identical model.
 
 Team-aware pit loss: the DP is solved separately per team present in each
 race, using data/team_pit_loss_adjustment.csv (circuit pit-loss + that
@@ -32,7 +42,13 @@ Run with: python notebooks/04_dp_baseline.py
 """
 import pandas as pd
 import numpy as np
+import importlib.util
 from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    'degradation_model_lib', Path(__file__).parent / '03_ml_degradation_model.py')
+dm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dm)
 
 BRONZE_DIR = Path('data/bronze')
 STARTING_FUEL_KG = 110
@@ -62,11 +78,11 @@ def solve_dp(n_laps: int, field_pace: pd.Series, degradation: dict, pit_loss: fl
         return None
 
     def expected_pace(lap, compound, age):
-        d = degradation[compound]
+        rel_pace = degradation[compound].get((lap, age))
         fp = field_pace.get(lap)
-        if fp is None or pd.isna(fp):
+        if rel_pace is None or fp is None or pd.isna(fp):
             return None
-        return fp + d['relative_intercept'] + d['tyre_age_slope'] * age
+        return fp + rel_pace
 
     def bit(c):
         return 1 << compounds.index(c)
@@ -118,10 +134,14 @@ def replay_actual(driver_laps: pd.DataFrame, field_pace: pd.Series, degradation:
         compound, age, lap = row['Compound'], row['TyreLife'], row['LapNumber']
         if compound not in degradation or pd.isna(age):
             return None
+        age_key = int(age)
+        if age_key > dm.MAX_AGE_GRID:
+            return None  # stint longer than the precomputed grid -- implausible, treat as unsupported
+        rel_pace = degradation[compound].get((int(lap), age_key))
         fp = field_pace.get(lap)
-        if fp is None or pd.isna(fp):
+        if rel_pace is None or fp is None or pd.isna(fp):
             return None
-        total += fp + degradation[compound]['relative_intercept'] + degradation[compound]['tyre_age_slope'] * age
+        total += fp + rel_pace
         compounds_used.add(compound)
         if row['LapNumber'] > 1 and age == 1:
             n_pits += 1
@@ -135,6 +155,7 @@ def main():
     deg_df = pd.read_csv('data/degradation_summary.csv')
     pit_df = pd.read_csv('data/pit_loss_summary.csv').set_index('race')['median_pit_loss']
     team_adj = pd.read_csv('data/team_pit_loss_adjustment.csv').set_index('team')['adjustment_s']
+    ml_bundle = dm.load_degradation_model()
 
     lap_files = sorted(BRONZE_DIR.glob('*_laps.parquet'))
     print(f"Processing {len(lap_files)} races\n")
@@ -155,13 +176,20 @@ def main():
         field_pace = compute_field_pace(laps)
 
         race_deg = deg_df[deg_df['race'] == race_id].set_index('compound').to_dict('index')
-        # Require >=30 laps behind a compound's per-race curve before letting the DP
-        # consider it -- thin samples (e.g. a handful of dry laps in a wet-disrupted
-        # race) produce noisy slope/intercept pairs that make alternating into that
-        # compound look artificially cheap, which is what drove the 6-stop
-        # Emilia Romagna 2022 result caught in the initial sanity check.
-        degradation = {c: race_deg[c] for c in DRY_COMPOUNDS
-                        if c in race_deg and race_deg[c]['n_laps'] >= 30}
+        # Eligibility: was this compound genuinely used in this race at all
+        # (not just a formation-lap fluke)? Unlike the old per-race linear
+        # fit, the ML model doesn't need many laps *from this race* to
+        # predict reliably -- it pools across all 103 races -- so this is a
+        # much lighter bar (>=5 laps) than the >=30 the linear version
+        # needed to avoid noisy per-race slopes. The Emilia Romagna 2022
+        # 6-stop sanity-check failure that originally motivated that gate
+        # was a property of the old model, not of compound usage itself.
+        eligible = [c for c in DRY_COMPOUNDS if c in race_deg and race_deg[c]['n_laps'] >= 5]
+        if len(eligible) < 2:
+            skipped += 1
+            continue
+        ml_lookup = dm.build_ml_pace_lookup(race_id, ml_bundle, eligible)
+        degradation = {c: ml_lookup[c] for c in eligible if c in ml_lookup}
         if len(degradation) < 2:
             skipped += 1
             continue

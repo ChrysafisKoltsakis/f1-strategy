@@ -176,11 +176,28 @@ def collect_pit_stop_losses(laps: pd.DataFrame, field_pace: pd.Series, degradati
     return records
 
 
+MIN_PLAUSIBLE_GREEN_PIT_LOSS = 12.0  # seconds -- pit-lane transit time alone rarely drops below this
+
+
 def estimate_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> dict:
+    """Green-flag pit loss. A physically implausible median (found via
+    the DP baseline exploiting it into a 47-stop "optimal" strategy once
+    a more expressive degradation model made the DP aggressive enough to
+    actually chase the exploit) means the in-lap/out-lap decomposition
+    got corrupted for this race -- e.g. a wet/disrupted race where the
+    "expected pace" baseline itself is unreliable (Emilia Romagna 2022,
+    caught this way, is a race already flagged elsewhere in this project
+    for exactly that kind of disruption) -- not a genuinely fast pit
+    lane. Rejected outright rather than silently trusted, same principle
+    as the >=30-lap gate on degradation curves elsewhere in this file."""
     losses = [r['loss'] for r in collect_pit_stop_losses(laps, field_pace, degradation)]
     if not losses:
         return {'n_stops': 0, 'median_pit_loss': None}
-    return {'n_stops': len(losses), 'median_pit_loss': float(np.median(losses)), 'std': float(np.std(losses))}
+    median_loss = float(np.median(losses))
+    if median_loss < MIN_PLAUSIBLE_GREEN_PIT_LOSS:
+        return {'n_stops': len(losses), 'median_pit_loss': None,
+                'rejected_implausible_median': median_loss}
+    return {'n_stops': len(losses), 'median_pit_loss': median_loss, 'std': float(np.std(losses))}
 
 
 def _is_sc_or_vsc(track_status) -> bool:
@@ -284,6 +301,10 @@ def main():
             print(f"  Pit loss (green): {pit_loss['median_pit_loss']:.2f}s "
                   f"(std {pit_loss['std']:.2f}, n={pit_loss['n_stops']} stops)")
             all_pit_loss_rows.append({'race': race_id, 'event': event_name, **pit_loss})
+        elif 'rejected_implausible_median' in pit_loss:
+            print(f"  Pit loss (green): REJECTED, implausible median "
+                  f"{pit_loss['rejected_implausible_median']:.2f}s from n={pit_loss['n_stops']} stops "
+                  f"(likely a disrupted race corrupting the expected-pace baseline)")
         else:
             print("  Pit loss (green): no valid stops")
         if sc_pit_loss['median_pit_loss'] is not None:

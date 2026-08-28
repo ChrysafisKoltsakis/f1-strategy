@@ -47,6 +47,19 @@ maintaining true incremental state. Fine for a single-race proof-of-
 concept (at most ~1500 lap events), not how a production system would do
 it at scale.
 
+Peak detection alone only ever answers "does this lap look like where
+similar drivers have historically pitted" -- an imitation-learned
+behavioral signal, not a cost or a risk. So when a peak fires, this now
+also calls straight into 10_live_risk_comparison.py's actual decision
+machinery (dynamic import, same reuse pattern as everywhere else) to
+answer the harder question: given only what's been observed in the
+stream so far, what does pitting right now actually cost versus waiting,
+and how does that change with the real historical odds of another
+SC/VSC window opening up later. That's the one addition that turns this
+from a live signal into an actual live recommendation -- probability,
+cost, and risk together, computed causally, lap by lap, exactly as a
+live system would have to.
+
 Requires: a running Kafka broker (see README), JAVA_HOME set, and a
 trained model at data/models/trigger_classifier.joblib (from
 05_trigger_classifier.py).
@@ -74,6 +87,14 @@ _spec = importlib.util.spec_from_file_location(
     'trigger_classifier_lib', Path(__file__).parent / '05_trigger_classifier.py')
 tc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tc)
+
+# Load 10_live_risk_comparison.py's pit-now-vs-wait DP machinery directly,
+# so the live recommendation uses the exact same decision logic already
+# validated standalone (e.g. the 2023_r08 MAG/PER case).
+_spec3 = importlib.util.spec_from_file_location(
+    'live_risk_lib', Path(__file__).parent / '10_live_risk_comparison.py')
+lr = importlib.util.module_from_spec(_spec3)
+_spec3.loader.exec_module(lr)
 
 LAP_SCHEMA = StructType([
     StructField('race', StringType()), StructField('driver', StringType()),
@@ -109,6 +130,77 @@ def load_static_context(race_id: str):
     return rivals, sc_prob_by_lap, bundle, n_laps, event_name
 
 
+def load_risk_context(race_id: str):
+    """Everything the live pit-now-vs-wait comparison needs that's also
+    knowable before the race starts: the ML degradation lookup for this
+    race's circuit/weather, the circuit's green + SC/VSC pit-loss
+    constants (team-adjusted), and the population-level SC/VSC recurrence
+    stats (pooled across all 103 races, so there's no per-race leakage in
+    querying them here). Returns None if this race's pit-loss estimate was
+    rejected as implausible (02_fixed_degradation_pitloss.py's
+    MIN_PLAUSIBLE_GREEN_PIT_LOSS floor) -- same races the batch tools
+    (04/06/10/11) already skip."""
+    deg_df = pd.read_csv('data/degradation_summary.csv')
+    race_deg = deg_df[deg_df['race'] == race_id].set_index('compound').to_dict('index')
+    eligible = [c for c in lr.DRY_COMPOUNDS if c in race_deg and race_deg[c]['n_laps'] >= 5]
+    ml_bundle = lr.dm.load_degradation_model()
+    ml_lookup = lr.dm.build_ml_pace_lookup(race_id, ml_bundle, eligible)
+    degradation = {c: ml_lookup[c] for c in eligible if c in ml_lookup}
+    compounds = list(degradation.keys())
+
+    pit_loss_summary = pd.read_csv('data/pit_loss_summary.csv').set_index('race')
+    if race_id not in pit_loss_summary.index or pd.isna(pit_loss_summary.loc[race_id, 'median_pit_loss']):
+        return None
+    green_pit_loss = float(pit_loss_summary.loc[race_id, 'median_pit_loss'])
+    sc_pit_loss = float(pd.read_csv('data/sc_pit_loss_summary.csv').set_index('race')['median_pit_loss']
+                         .get(race_id, green_pit_loss * 0.5))
+    team_adj = pd.read_csv('data/team_pit_loss_adjustment.csv').set_index('team')['adjustment_s']
+
+    print("Building historical SC/VSC recurrence statistics (one-time, pooled across all races)...")
+    _, rec_df = lr.build_historical_sc_stats()
+
+    return {'degradation': degradation, 'compounds': compounds, 'green_pit_loss': green_pit_loss,
+            'sc_pit_loss': sc_pit_loss, 'team_adj': team_adj, 'rec_df': rec_df}
+
+
+def evaluate_pit_now_vs_wait(driver: str, team: str, lap: int, compound: str, age: int,
+                              laps_so_far: pd.DataFrame, n_laps: int, risk_ctx: dict) -> str | None:
+    """The actual live recommendation: given only laps observed so far,
+    what does pitting right now cost versus waiting, and how does the real
+    historical chance of another SC/VSC window change that. Same DP
+    machinery as 10_live_risk_comparison.py's standalone tool, just called
+    from the accumulated live state instead of a fixed decision lap
+    argument, and using causal_field_pace_forecast() instead of
+    10's own hindsight field-pace lookup. Returns None if this driver's
+    current compound was never modeled for this race (too few laps) or a
+    state can't be solved from here (e.g. too few laps remaining)."""
+    if compound not in risk_ctx['compounds']:
+        return None
+    degradation, compounds = risk_ctx['degradation'], risk_ctx['compounds']
+    pit_loss = risk_ctx['green_pit_loss'] + float(risk_ctx['team_adj'].get(team, 0.0))
+    sc_pit_loss = risk_ctx['sc_pit_loss']
+    field_pace = lr.causal_field_pace_forecast(laps_so_far, n_laps)
+    mask_bit = 1 << compounds.index(compound)
+    progress = lap / n_laps
+
+    opt_a = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
+                                    pit_loss, compounds, discount_price=sc_pit_loss, force_stop_at_start=True)
+    opt_b_worst = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
+                                          pit_loss, compounds)
+    opt_b_best = lr.solve_dp_from_state(n_laps, field_pace, degradation, lap, compound, age, mask_bit,
+                                         pit_loss, compounds, discount_price=sc_pit_loss)
+    if not (opt_a and opt_b_worst and opt_b_best):
+        return None
+
+    p_again, n_events = lr.p_another_event(risk_ctx['rec_df'], progress)
+    expected_b = p_again * opt_b_best['cost'] + (1 - p_again) * opt_b_worst['cost']
+    diff = expected_b - opt_a['cost']
+    verdict = "pit NOW" if diff > 0 else "WAIT"
+    return (f"      -> pit now: {opt_a['cost']:.1f}s total  |  wait, worst case: {opt_b_worst['cost']:.1f}s  |  "
+            f"wait, SC/VSC again (P={p_again*100:.0f}%, n={n_events}): {opt_b_best['cost']:.1f}s  |  "
+            f"wait expected: {expected_b:.1f}s  ==>  {verdict} looks better by {abs(diff):.1f}s on expectation")
+
+
 def to_bronze_shape(batch: pd.DataFrame) -> pd.DataFrame:
     """Reshape the live Kafka message schema back into the same column
     names/dtypes build_race_features() expects from Bronze laps."""
@@ -132,7 +224,15 @@ def main():
 
     rivals, sc_prob_by_lap, bundle, n_laps, event_name = load_static_context(race_id)
     model, feature_cols, compound_categories = bundle['model'], bundle['feature_cols'], bundle['compound_categories']
-    print(f"Loaded model + static context for {race_id} ({event_name}, {n_laps} laps)\n")
+    print(f"Loaded model + static context for {race_id} ({event_name}, {n_laps} laps)")
+
+    risk_ctx = load_risk_context(race_id)
+    if risk_ctx is None:
+        print("No usable pit-loss estimate for this race -- peak flags will fire without a "
+              "pit-now-vs-wait cost comparison.\n")
+    else:
+        print(f"Risk/reward context ready: {len(risk_ctx['compounds'])} compounds modeled, "
+              f"green pit loss {risk_ctx['green_pit_loss']:.1f}s, SC/VSC pit loss {risk_ctx['sc_pit_loss']:.1f}s\n")
 
     seen_history = {'df': pd.DataFrame()}       # accumulated laps seen so far this race
     last_recommendation_lap = {}                 # driver -> last lap a recommendation fired, resets after a real stop
@@ -228,6 +328,21 @@ def main():
 
             print(f"  lap {lap:2.0f}  {driver}  P(pit)={p:.2f}  tyre_age={row['own_tyre_age']:.0f} "
                   f"{row['own_compound']}{flag}")
+
+            # A peak alone only says "this looks like where similar drivers
+            # have historically pitted" -- it's an imitation-learned
+            # behavioral signal, not a cost. Re-solve the actual pit-now-
+            # vs-wait DP from the CURRENT lap (not the flagged lap -- that
+            # one's already gone) using only laps seen so far, so the
+            # printed recommendation carries a real cost/risk number, not
+            # just a probability.
+            if flag and risk_ctx is not None and pd.notna(row['own_tyre_age']):
+                team = laps_so_far.loc[laps_so_far['Driver'] == driver, 'Team'].iloc[-1]
+                risk_line = evaluate_pit_now_vs_wait(
+                    driver, team, int(lap), row['own_compound'], int(row['own_tyre_age']),
+                    laps_so_far, n_laps, risk_ctx)
+                if risk_line:
+                    print(risk_line)
 
     spark = SparkSession.builder \
         .appName('f1-streaming-consumer') \
