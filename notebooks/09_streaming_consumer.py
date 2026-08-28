@@ -297,6 +297,7 @@ def main():
             # true online operation, not hidden behind the printed output.
             history = prob_history.setdefault(driver, [])
             flag = ""
+            already_acted = False
             if history:
                 prev_lap, prev_p = history[-1]
                 stint_start = last_pit_lap.get(driver, -1)
@@ -320,6 +321,17 @@ def main():
                     flag = f"  <-- peak was lap {prev_lap:.0f} (P={prev_p:.2f}), consider pitting there"
                     last_recommendation_lap[driver] = lap
                     armed[driver] = False
+                    # The flagged peak lap can itself BE the lap the driver
+                    # really pitted on (stint_start == prev_lap: this stint's
+                    # history starts with that lap's own probability, so a
+                    # peak can only ever point at or after it). Found by
+                    # running this end-to-end on a real race: by the time the
+                    # one-lap detection lag lets the flag fire, the driver had
+                    # already pitted at the very lap being flagged, so
+                    # "pit now" is no longer a live choice -- their tyre age
+                    # is already back to 1 on a new compound, and evaluating
+                    # a cost comparison against that state is meaningless.
+                    already_acted = (prev_lap == stint_start)
             # Re-arm using THIS lap's own value, checked after this lap's
             # peak-check above so it only affects future comparisons.
             if p < LIVE_THRESHOLD * 0.5:
@@ -329,6 +341,8 @@ def main():
             print(f"  lap {lap:2.0f}  {driver}  P(pit)={p:.2f}  tyre_age={row['own_tyre_age']:.0f} "
                   f"{row['own_compound']}{flag}")
 
+            if flag and already_acted:
+                print("      (already pitted at the flagged lap -- no live pit-now-vs-wait decision left to evaluate)")
             # A peak alone only says "this looks like where similar drivers
             # have historically pitted" -- it's an imitation-learned
             # behavioral signal, not a cost. Re-solve the actual pit-now-
@@ -336,7 +350,7 @@ def main():
             # one's already gone) using only laps seen so far, so the
             # printed recommendation carries a real cost/risk number, not
             # just a probability.
-            if flag and risk_ctx is not None and pd.notna(row['own_tyre_age']):
+            elif flag and risk_ctx is not None and pd.notna(row['own_tyre_age']):
                 team = laps_so_far.loc[laps_so_far['Driver'] == driver, 'Team'].iloc[-1]
                 risk_line = evaluate_pit_now_vs_wait(
                     driver, team, int(lap), row['own_compound'], int(row['own_tyre_age']),
