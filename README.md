@@ -8,11 +8,11 @@ Ingests multi-season F1 timing/telemetry data (via [FastF1](https://github.com/t
 
 Currently in the experimentation phase. Built so far:
 
-- **Bronze-layer ingestion** (`notebooks/01_pull_half_season.py`) — pulls race sessions (laps, weather, race-control messages) via FastF1 and lands them as Parquet.
+- **Bronze-layer ingestion** (`notebooks/01_pull_bronze_data.py`) — pulls race sessions (laps, weather, race-control messages) via FastF1 across multiple seasons (2022+) and lands them as Parquet. Idempotent — safe to re-run as new seasons/rounds become available.
 - **Cleaning + degradation/pit-loss modeling** (`notebooks/02_fixed_degradation_pitloss.py`) — filters pit laps, standing-start laps, SC/VSC-restart-affected laps, and non-green-flag laps; detrends lap time against the field's per-lap median pace to separate tyre degradation from track evolution; estimates per-circuit pit-loss constants from paired in-lap/out-lap deltas.
 - **ML degradation model** (`notebooks/03_ml_degradation_model.py`) — LightGBM model predicting relative pace (vs. field median) from tyre age, compound, weather, and circuit, validated with leave-one-circuit-out cross-validation (~0.65s MAE on unseen circuits).
 
-Not yet built: multi-season data, the real-time trigger/strategy classifier, the DP hindsight-optimal baseline, the streaming (Kafka) layer, and the dashboard.
+Not yet built: the real-time trigger/strategy classifier, the DP hindsight-optimal baseline, the streaming (Kafka) layer, and the dashboard.
 
 ## Setup
 

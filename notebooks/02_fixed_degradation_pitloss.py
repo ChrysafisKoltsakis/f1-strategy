@@ -124,7 +124,7 @@ def fit_degradation(clean: pd.DataFrame) -> dict:
     return results
 
 
-def estimate_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> dict:
+def collect_pit_stop_losses(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> list:
     """
     Pair in-laps with out-laps per driver, restricted to stops run entirely
     under green flag (SC/VSC/red-flag stops have in/out times inflated by
@@ -132,13 +132,83 @@ def estimate_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: di
     estimate if included). Compare each lap's actual time against
     FieldPace[lap] + degradation curve at that tyre age -- the field's
     actual pace that lap, adjusted for tyre wear, not a flat average.
+    Returns one record per stop (Driver, Team, loss) rather than an
+    aggregate, so callers can pool per-race (circuit constant) or across
+    races (per-team crew-speed adjustment).
     """
     laps = laps.join(field_pace, on='LapNumber')
     green = laps['TrackStatus'] == '1'
+    team_col = 'Team' if 'Team' in laps.columns else None
+    cols = ['Driver', 'LapNumber', 'FuelCorrectedLapTime', 'Compound', 'TyreLife', 'FieldPace']
+    if team_col:
+        cols.append(team_col)
 
-    in_laps = laps[laps['PitInTime'].notna() & green][
+    in_laps = laps[laps['PitInTime'].notna() & green][cols]
+    out_laps = laps[laps['PitOutTime'].notna() & green][cols]
+
+    def expected_pace(row):
+        deg = degradation.get(row['Compound'])
+        if deg is None or pd.isna(row['FieldPace']) or pd.isna(row['TyreLife']):
+            return None
+        return row['FieldPace'] + deg['relative_intercept'] + deg['tyre_age_slope'] * row['TyreLife']
+
+    records = []
+    for _, in_lap in in_laps.iterrows():
+        match = out_laps[
+            (out_laps['Driver'] == in_lap['Driver']) &
+            (out_laps['LapNumber'] == in_lap['LapNumber'] + 1)
+        ]
+        if match.empty or pd.isna(in_lap['FuelCorrectedLapTime']):
+            continue
+        out_lap = match.iloc[0]
+        if pd.isna(out_lap['FuelCorrectedLapTime']):
+            continue
+
+        expected_in = expected_pace(in_lap)
+        expected_out = expected_pace(out_lap)
+        if expected_in is None or expected_out is None:
+            continue
+
+        loss = (in_lap['FuelCorrectedLapTime'] - expected_in) + (out_lap['FuelCorrectedLapTime'] - expected_out)
+        records.append({
+            'driver': in_lap['Driver'], 'team': in_lap[team_col] if team_col else None, 'loss': loss,
+        })
+    return records
+
+
+def estimate_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> dict:
+    losses = [r['loss'] for r in collect_pit_stop_losses(laps, field_pace, degradation)]
+    if not losses:
+        return {'n_stops': 0, 'median_pit_loss': None}
+    return {'n_stops': len(losses), 'median_pit_loss': float(np.median(losses)), 'std': float(np.std(losses))}
+
+
+def _is_sc_or_vsc(track_status) -> bool:
+    """True if full Safety Car ('4') or Virtual Safety Car ('6'/'7') is
+    active per FastF1's concatenated per-lap TrackStatus codes. Red flag
+    ('5') is deliberately excluded even if it co-occurs -- a red-flag stop
+    is a different regime (near-zero cost, field fully stationary) that
+    would corrupt an SC/VSC pit-loss estimate if pooled in."""
+    return isinstance(track_status, str) and any(c in track_status for c in '467') and '5' not in track_status
+
+
+def estimate_sc_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> dict:
+    """
+    Same in-lap/out-lap decomposition as estimate_pit_loss, but for stops
+    taken while SC/VSC is active on the in-lap (the lap the driver commits
+    to pitting) -- this is the separate, much cheaper pit-loss constant
+    real teams rely on when deciding to "pit under the SC". FieldPace
+    already reflects the SC/VSC-slowed pace for that lap number (it's
+    computed from the whole unfiltered field, not just green laps), so the
+    same actual-vs-expected decomposition isolates the pit-lane-specific
+    cost on top of the SC slowdown, same as the green-flag estimate does.
+    """
+    laps = laps.join(field_pace, on='LapNumber')
+    sc_mask = laps['TrackStatus'].apply(_is_sc_or_vsc)
+
+    in_laps = laps[laps['PitInTime'].notna() & sc_mask][
         ['Driver', 'LapNumber', 'FuelCorrectedLapTime', 'Compound', 'TyreLife', 'FieldPace']]
-    out_laps = laps[laps['PitOutTime'].notna() & green][
+    out_laps = laps[laps['PitOutTime'].notna()][
         ['Driver', 'LapNumber', 'FuelCorrectedLapTime', 'Compound', 'TyreLife', 'FieldPace']]
 
     def expected_pace(row):
@@ -178,6 +248,8 @@ def main():
 
     all_degradation_rows = []
     all_pit_loss_rows = []
+    all_sc_pit_loss_rows = []
+    all_stop_records = []  # per-stop (team, loss, circuit baseline) for the team-adjustment pass
 
     for f in lap_files:
         race_id = f.stem.replace('_laps', '')
@@ -188,32 +260,70 @@ def main():
         field_pace = compute_field_pace(laps)
         clean = clean_laps(laps, field_pace)
         degradation = fit_degradation(clean)
+        stop_records = collect_pit_stop_losses(laps, field_pace, degradation)
         pit_loss = estimate_pit_loss(laps, field_pace, degradation)
+        sc_pit_loss = estimate_sc_pit_loss(laps, field_pace, degradation)
+
+        if pit_loss['median_pit_loss'] is not None:
+            for r in stop_records:
+                all_stop_records.append({**r, 'race': race_id, 'circuit_pit_loss': pit_loss['median_pit_loss']})
 
         print(f"=== {race_id}: {event_name} ===")
         print(f"  {len(laps)} total laps -> {len(clean)} clean laps after filtering "
               f"({100*len(clean)/len(laps):.0f}%)")
         for compound, d in degradation.items():
+            stint_slope_str = (f"{d['median_stint_slope']:+.3f}" if d['median_stint_slope'] is not None
+                                else "n/a")
             print(f"  {compound:8s}: pooled slope {d['tyre_age_slope']:+.3f} s/lap, "
-                  f"median per-stint slope {d['median_stint_slope']:+.3f} s/lap "
+                  f"median per-stint slope {stint_slope_str} s/lap "
                   f"(n={d['n_laps']} laps, {d['n_stints']} stints)")
             all_degradation_rows.append({
                 'race': race_id, 'event': event_name, 'compound': compound, **d
             })
         if pit_loss['median_pit_loss'] is not None:
-            print(f"  Pit loss: {pit_loss['median_pit_loss']:.2f}s "
+            print(f"  Pit loss (green): {pit_loss['median_pit_loss']:.2f}s "
                   f"(std {pit_loss['std']:.2f}, n={pit_loss['n_stops']} stops)")
             all_pit_loss_rows.append({'race': race_id, 'event': event_name, **pit_loss})
         else:
-            print("  Pit loss: no valid green-flag stops")
+            print("  Pit loss (green): no valid stops")
+        if sc_pit_loss['median_pit_loss'] is not None:
+            print(f"  Pit loss (SC/VSC): {sc_pit_loss['median_pit_loss']:.2f}s "
+                  f"(std {sc_pit_loss['std']:.2f}, n={sc_pit_loss['n_stops']} stops)")
+            all_sc_pit_loss_rows.append({'race': race_id, 'event': event_name, **sc_pit_loss})
+        else:
+            print("  Pit loss (SC/VSC): no valid stops")
         print()
 
     deg_df = pd.DataFrame(all_degradation_rows)
     pit_df = pd.DataFrame(all_pit_loss_rows)
+    sc_pit_df = pd.DataFrame(all_sc_pit_loss_rows)
     deg_df.to_csv('data/degradation_summary.csv', index=False)
     pit_df.to_csv('data/pit_loss_summary.csv', index=False)
+    sc_pit_df.to_csv('data/sc_pit_loss_summary.csv', index=False)
     print(f"Saved data/degradation_summary.csv ({len(deg_df)} rows)")
     print(f"Saved data/pit_loss_summary.csv ({len(pit_df)} rows)")
+    print(f"Saved data/sc_pit_loss_summary.csv ({len(sc_pit_df)} rows)")
+
+    # Team-specific pit-loss adjustment: a team's per-race stop count is far
+    # too small (2 cars, 1-2 stops each) to fit a stable per-(circuit, team)
+    # constant directly. Pit-crew execution speed is also largely
+    # circuit-independent (only the pit-lane transit time is circuit-
+    # specific), so instead pool each stop's deviation from that race's own
+    # circuit-wide pit-loss constant across ALL of a team's stops, at every
+    # circuit -- giving a much bigger, more stable sample per team. Applied
+    # downstream as: team_pit_loss(circuit, team) = circuit_pit_loss(circuit)
+    # + team_adjustment(team).
+    MIN_TEAM_STOPS = 15
+    stops_df = pd.DataFrame(all_stop_records)
+    stops_df['deviation'] = stops_df['loss'] - stops_df['circuit_pit_loss']
+    team_adj = stops_df.groupby('team')['deviation'].agg(['median', 'count']).reset_index()
+    team_adj.columns = ['team', 'adjustment_s', 'n_stops']
+    team_adj = team_adj[team_adj['n_stops'] >= MIN_TEAM_STOPS].sort_values('adjustment_s')
+    team_adj.to_csv('data/team_pit_loss_adjustment.csv', index=False)
+    print(f"\nTeam pit-loss adjustment (negative = faster than field average):")
+    print(team_adj.to_string(index=False))
+    print(f"Saved data/team_pit_loss_adjustment.csv ({len(team_adj)} teams, "
+          f"min {MIN_TEAM_STOPS} stops to be included)")
 
 
 if __name__ == '__main__':
