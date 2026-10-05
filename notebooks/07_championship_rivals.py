@@ -12,10 +12,20 @@ For each (race, driver), computes:
   - nearest constructors'-championship rival TEAM: the closest opposing
     constructor in points, same leave-out-this-race discipline
 
-Cumulative points are summed only over races strictly *before* the one
-being evaluated, within the same season (championships reset each year)
--- so a race's own result can never leak into its own "who is my rival"
-feature, same discipline as the SC-probability feature.
+"Standings before this race" = the official Jolpica standings after the
+previous round (landed by 01_pull_bronze_data.py), plus this weekend's
+sprint points if it was a sprint weekend -- the sprint runs before the
+race, so its result is known at race start and isn't leakage. Earlier
+versions summed race-session points from the Bronze results instead,
+which silently missed every sprint point and any official adjustment.
+Ties are broken by the previous round's official position (countback),
+not arbitrarily. Standings reset each season, so round 1 has no prior
+standings unless it's a sprint weekend.
+
+Also cross-checks that previous standings + sprint + this race's points
+reproduce the official standings after this round -- a mismatch means a
+post-race penalty/adjustment, or FastF1 and Jolpica round numbers not
+lining up, which would silently pair races with the wrong standings.
 
 Run with: python notebooks/07_championship_rivals.py
 """
@@ -25,91 +35,134 @@ from pathlib import Path
 BRONZE_DIR = Path('data/bronze')
 
 
-def load_all_results() -> pd.DataFrame:
-    files = sorted(BRONZE_DIR.glob('*_results.parquet'))
+def load_bronze(suffix: str) -> pd.DataFrame:
     dfs = []
-    for f in files:
-        race_id = f.stem.replace('_results', '')
+    for f in sorted(BRONZE_DIR.glob(f'*_{suffix}.parquet')):
         df = pd.read_parquet(f)
-        df['race'] = race_id
+        df['race'] = f.stem.replace(f'_{suffix}', '')
         dfs.append(df)
-    return pd.concat(dfs, ignore_index=True)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def standings_before(official: pd.DataFrame, sprints: pd.DataFrame, year: int, rnd: int,
+                     id_col: str) -> pd.DataFrame:
+    """[id_col, points] sorted best-first: official standings after round
+    rnd-1 plus round rnd's sprint points (if any). Empty if neither exists."""
+    prev = official[(official['Year'] == year) & (official['RoundNumber'] == rnd - 1)]
+    prev = prev.set_index(id_col)[['points', 'position']]
+    if not sprints.empty:
+        sprint = sprints[(sprints['Year'] == year) & (sprints['RoundNumber'] == rnd)]
+        sprint_pts = sprint.groupby(id_col)['points'].sum()
+        prev = prev.reindex(prev.index.union(sprint_pts.index))
+        prev['points'] = prev['points'].fillna(0.0) + sprint_pts.reindex(prev.index).fillna(0.0)
+    return (prev.sort_values(['points', 'position'], ascending=[False, True], na_position='last')
+                .reset_index()[[id_col, 'points']])
+
+
+def nearest_rival(standings: pd.DataFrame, id_col: str, me):
+    """Closer of the entries immediately above/below `me` in points."""
+    names = standings[id_col].tolist()
+    if me not in names:
+        return None, None
+    pts = dict(zip(standings[id_col], standings['points']))
+    idx = names.index(me)
+    candidates = []
+    if idx > 0:
+        candidates.append((names[idx - 1], pts[names[idx - 1]] - pts[me]))
+    if idx < len(names) - 1:
+        candidates.append((names[idx + 1], pts[me] - pts[names[idx + 1]]))
+    return min(candidates, key=lambda x: x[1]) if candidates else (None, None)
+
+
+def check_standings_consistency(results, driver_official, sprints) -> pd.DataFrame:
+    """Rows where official(r) != official(r-1) + sprint(r) + race(r) points."""
+    rows = []
+    for (year, rnd), race_rows in results.groupby(['Year', 'RoundNumber']):
+        after = driver_official[(driver_official['Year'] == year) & (driver_official['RoundNumber'] == rnd)]
+        if after.empty:
+            continue
+        before = standings_before(driver_official, sprints, year, rnd, 'driverId').set_index('driverId')['points']
+        race_pts = race_rows.groupby('DriverId')['Points'].sum()
+        ids = before.index.union(race_pts.index).union(after['driverId'])
+        expected = before.reindex(ids).fillna(0.0) + race_pts.reindex(ids).fillna(0.0)
+        actual = after.set_index('driverId')['points'].reindex(ids).fillna(0.0)
+        for d in ids[(expected - actual).abs() > 1e-6]:
+            rows.append({'race': race_rows['race'].iloc[0], 'driverId': d,
+                         'expected': expected[d], 'official': actual[d]})
+    return pd.DataFrame(rows)
 
 
 def main():
-    results = load_all_results()
+    results = load_bronze('results')
+    if not {'DriverId', 'TeamId'} <= set(results.columns):
+        raise SystemExit("Bronze results predate the DriverId/TeamId columns -- delete "
+                         "data/bronze/*_results.parquet and *_laps.parquet and re-run 01_pull_bronze_data.py")
+    driver_official = load_bronze('standings_drivers')
+    team_official = load_bronze('standings_constructors')
+    sprints = load_bronze('sprint')
+    if driver_official.empty or team_official.empty:
+        raise SystemExit("No standings in data/bronze -- re-run 01_pull_bronze_data.py")
     results = results.sort_values(['Year', 'RoundNumber'])
 
     rows = []
+    missing_prev = []
     for year, season in results.groupby('Year'):
-        rounds = sorted(season['RoundNumber'].unique())
-        cum_driver_points = {}   # Driver -> points accumulated so far (before current round)
-        cum_team_points = {}     # Team -> points accumulated so far
+        # id -> the name the rest of the pipeline uses (FastF1 abbreviation /
+        # team name), latest seen in the season; this race's own team names
+        # take precedence below, since teams can be renamed between seasons.
+        # Falls back to Jolpica's driver code for a rival who has no Bronze
+        # race this season (e.g. sat out with injury).
+        season_driver_name = season.drop_duplicates('DriverId', keep='last').set_index('DriverId')['Driver'] \
+            .combine_first(driver_official[driver_official['Year'] == year]
+                           .drop_duplicates('driverId', keep='last').set_index('driverId')['driverCode'])
+        season_team_name = season.drop_duplicates('TeamId', keep='last').set_index('TeamId')['Team']
 
-        for rnd in rounds:
-            race_rows = season[season['RoundNumber'] == rnd]
+        for rnd, race_rows in season.groupby('RoundNumber'):
             race_id = race_rows['race'].iloc[0]
-
-            # Standings BEFORE this race -- snapshot prior to adding this
-            # round's points, so this race's own result can't leak into
-            # its own rival identification.
-            driver_standings = sorted(cum_driver_points.items(), key=lambda x: -x[1])
-            team_standings = sorted(cum_team_points.items(), key=lambda x: -x[1])
+            if rnd > 1 and not ((driver_official['Year'] == year) & (driver_official['RoundNumber'] == rnd - 1)).any():
+                missing_prev.append(race_id)
+            drv = standings_before(driver_official, sprints, year, rnd, 'driverId')
+            team = standings_before(team_official, sprints, year, rnd, 'constructorId')
+            drv_pts = dict(zip(drv['driverId'], drv['points']))
+            team_pts = dict(zip(team['constructorId'], team['points']))
+            team_name = race_rows.drop_duplicates('TeamId').set_index('TeamId')['Team'].combine_first(season_team_name)
 
             for _, r in race_rows.iterrows():
-                driver, team = r['Driver'], r['Team']
-
-                # Nearest drivers'-championship rival: closer of the driver
-                # immediately above or below in points-so-far. Drivers with
-                # no prior-season history (rookies, mid-season debuts) get
-                # no rival for their first race -- nothing to compare yet.
-                names = [d for d, _ in driver_standings]
-                pts = dict(driver_standings)
-                rival_driver, rival_gap = None, None
-                if driver in names:
-                    idx = names.index(driver)
-                    candidates = []
-                    if idx > 0:
-                        candidates.append((names[idx - 1], pts[names[idx - 1]] - pts[driver]))
-                    if idx < len(names) - 1:
-                        candidates.append((names[idx + 1], pts[driver] - pts[names[idx + 1]]))
-                    if candidates:
-                        rival_driver, rival_gap = min(candidates, key=lambda x: x[1])
-
-                team_names = [t for t, _ in team_standings]
-                team_pts = dict(team_standings)
-                rival_team, rival_team_gap = None, None
-                if team in team_names:
-                    idx = team_names.index(team)
-                    candidates = []
-                    if idx > 0:
-                        candidates.append((team_names[idx - 1], team_pts[team_names[idx - 1]] - team_pts[team]))
-                    if idx < len(team_names) - 1:
-                        candidates.append((team_names[idx + 1], team_pts[team] - team_pts[team_names[idx + 1]]))
-                    if candidates:
-                        rival_team, rival_team_gap = min(candidates, key=lambda x: x[1])
-
+                # Drivers with no standings entry yet (season debut on a
+                # non-sprint weekend) get no rival -- nothing to compare yet.
+                rival_driver, rival_gap = nearest_rival(drv, 'driverId', r['DriverId'])
+                rival_team, rival_team_gap = nearest_rival(team, 'constructorId', r['TeamId'])
                 rows.append({
-                    'race': race_id, 'year': year, 'round': rnd, 'driver': driver, 'team': team,
-                    'drivers_champ_points_before': pts.get(driver, 0.0),
-                    'rival_driver': rival_driver, 'rival_driver_points_gap': rival_gap,
-                    'constructors_champ_points_before': team_pts.get(team, 0.0),
-                    'rival_team': rival_team, 'rival_team_points_gap': rival_team_gap,
+                    'race': race_id, 'year': year, 'round': rnd, 'driver': r['Driver'], 'team': r['Team'],
+                    'drivers_champ_points_before': drv_pts.get(r['DriverId'], 0.0),
+                    'rival_driver': season_driver_name.get(rival_driver, rival_driver),
+                    'rival_driver_points_gap': rival_gap,
+                    'constructors_champ_points_before': team_pts.get(r['TeamId'], 0.0),
+                    'rival_team': team_name.get(rival_team, rival_team),
+                    'rival_team_points_gap': rival_team_gap,
                 })
-
-            # Now fold this round's actual points into the running totals,
-            # for use as the "before" snapshot of the *next* round.
-            for _, r in race_rows.iterrows():
-                cum_driver_points[r['Driver']] = cum_driver_points.get(r['Driver'], 0.0) + r['Points']
-                cum_team_points[r['Team']] = cum_team_points.get(r['Team'], 0.0) + r['Points']
 
     out = pd.DataFrame(rows)
     out.to_csv('data/championship_rivals.csv', index=False)
     print(f"Saved data/championship_rivals.csv ({len(out)} rows)")
 
+    if missing_prev:
+        print(f"\nWARNING: no official standings for the previous round of {len(missing_prev)} race(s) -- "
+              f"those races have no rivals: {', '.join(missing_prev)}. Re-run 01_pull_bronze_data.py.")
+
+    mismatches = check_standings_consistency(results, driver_official, sprints)
+    if mismatches.empty:
+        print("\nStandings cross-check: previous standings + sprint + race points match the official "
+              "standings after every round")
+    else:
+        print(f"\nStandings cross-check: {len(mismatches)} (race, driver) mismatches across "
+              f"{mismatches['race'].nunique()} race(s) -- post-race penalties/adjustments, or a "
+              f"FastF1/Jolpica round misalignment if a whole race is off:")
+        print(mismatches.to_string(index=False))
+
     has_rival = out['rival_driver'].notna().mean()
     print(f"\n{has_rival*100:.1f}% of (race, driver) rows have an identified drivers'-championship rival "
-          f"(rest are each driver's first race of a season -- no prior standings to compare against)")
+          f"(rest have no standings yet -- season debut on a non-sprint weekend)")
 
     last_year = out['year'].max()
     last_round = out.loc[out['year'] == last_year, 'round'].max()

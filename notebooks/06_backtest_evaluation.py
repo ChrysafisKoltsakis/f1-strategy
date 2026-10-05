@@ -4,12 +4,14 @@ strategy vs. DP hindsight-optimal, all replayed through the same
 expected-pace model so the comparison is about strategy quality, not
 driving quality. This is the thesis's central evaluation chapter.
 
-Scoped to the 20 races the trigger classifier was evaluated on (held out
-of its own training, per notebooks/05_trigger_classifier.py) intersected
-with the races the DP baseline could solve (notebooks/04_dp_baseline.py
-already excludes wet/disrupted races and races missing a pit-loss
-constant) -- so all three legs of the comparison are computed on exactly
-the same race/driver set.
+Scoped to the races the trigger classifier was evaluated on (the most
+recent ~20%, held out of its own training, per
+notebooks/05_trigger_classifier.py) intersected with the races the DP
+baseline could solve (notebooks/04_dp_baseline.py already excludes
+wet/disrupted races and races missing a pit-loss constant) -- so all
+three legs of the comparison are computed on exactly the same race/driver
+set, and over the same distance per driver (a lapped driver's own lap
+count, as in 04).
 
 Classifier -> strategy conversion: the classifier only predicts *when* to
 pit, not which compound to fit, so a driver's predicted-positive laps are
@@ -59,7 +61,7 @@ def argmax_single_stop(dgrp: pd.DataFrame, n_laps: int) -> list:
     probability, as long as it's a realistic lap to pit on (not the first
     or last couple of laps). Tests whether the model's probability
     *ranking* is more useful than its thresholded yes/no output -- most
-    real races are one-stop anyway (76/83 in the DP baseline), so a
+    real races are one-stop anyway (63/78 in the DP baseline), so a
     single-stop rule is a fair like-for-like comparison."""
     eligible = dgrp[(dgrp['lap'] > 2) & (dgrp['lap'] < n_laps - 1)]
     if eligible.empty:
@@ -165,7 +167,12 @@ def replay_strategy(stop_laps: list, start_compound: str, n_laps: int,
         return (later[0] - 1) if later else n_laps
 
     def best_compound(used: set, lap: int):
-        candidates = [c for c in degradation if c not in used] or list(degradation)
+        # Only force an unused compound while the two-compound rule is still
+        # unmet; after that, any compound (same one included) is fair game,
+        # matching what the DP baseline is allowed to do.
+        candidates = list(degradation)
+        if len(used) < 2:
+            candidates = [c for c in candidates if c not in used] or candidates
         end = stint_end(lap)
         scored = []
         for c in candidates:
@@ -219,7 +226,6 @@ def main():
     for race_id in races:
         laps = pd.read_parquet(BRONZE_DIR / f"{race_id}_laps.parquet")
         laps = fuel_correct(laps)
-        n_laps = int(laps['LapNumber'].max())
         field_pace = compute_field_pace(laps)
 
         race_deg = deg_df[deg_df['race'] == race_id].set_index('compound').to_dict('index')
@@ -244,6 +250,9 @@ def main():
             # fixed plan, so classifier/ranking replays need the same
             # team-adjusted constant to be a fair comparison against it.
             pit_loss = float(dp_row['team_pit_loss_s'])
+            # Same distance the DP baseline and actual replay were scored
+            # over: a lapped driver's own lap count, not the race's.
+            n_laps = int(dp_row['driver_n_laps'])
 
             start_compound = laps.loc[
                 (laps['Driver'] == driver) & (laps['LapNumber'] == 1), 'Compound']

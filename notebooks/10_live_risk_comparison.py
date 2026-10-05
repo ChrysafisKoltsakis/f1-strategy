@@ -94,7 +94,7 @@ def extract_sc_events(race_id: str) -> list:
 
 
 def build_historical_sc_stats():
-    """Across all 103 races: (a) SC/VSC duration distribution, (b) how
+    """Across every race: (a) SC/VSC duration distribution, (b) how
     often a race with one SC/VSC event gets at least one more later --
     the real, historical answer to "if I wait, how often does that pay
     off." Both computed from the full population, not race-specific, so
@@ -208,9 +208,7 @@ def solve_dp_from_state(n_laps: int, field_pace: pd.Series, degradation: dict,
                     new_cost = cost + ep
                     if new_cost < new_states.get(key, (INF, None))[0]:
                         new_states[key] = (new_cost, path)
-            for c2 in compounds:
-                if c2 == c:
-                    continue
+            for c2 in compounds:  # same compound allowed -- a fresh set, age reset to 1
                 ep2 = expected_pace(lap, c2, 1)
                 if ep2 is None:
                     continue

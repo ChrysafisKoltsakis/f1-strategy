@@ -56,7 +56,9 @@ def main():
 
     laps = pd.read_parquet(BRONZE_DIR / f"{race_id}_laps.parquet")
     laps = bt.fuel_correct(laps)
-    n_laps = int(laps['LapNumber'].max())
+    # The driver's own distance, matching how 04/06 score a lapped driver --
+    # the race's lap count would make every candidate look worse than DP-optimal.
+    n_laps = int(laps.loc[laps['Driver'] == driver, 'LapNumber'].max())
     field_pace = bt.compute_field_pace(laps)
     event_name = laps['EventName'].iloc[0]
     team = laps.loc[laps['Driver'] == driver, 'Team'].iloc[0]

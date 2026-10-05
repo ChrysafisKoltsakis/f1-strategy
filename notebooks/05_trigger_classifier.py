@@ -1,14 +1,14 @@
 """
 Phase 4 -- trigger/strategy classifier (imitation learning). The hard,
 novel part of the thesis: predict whether a team pits on a given lap, by
-learning from what real teams actually did across 103 races (2022-2026),
+learning from what real teams actually did across every race pulled (2022-2026),
 rather than a hand-built hazard-rate/Bayesian trigger model -- see the
 project's ML-not-stats framing decision. GBM-first (LightGBM), not a
 sequence model, per the build plan.
 
 Label: did this driver pit at the end of this (driver, lap) -- i.e. is
-PitInTime set on this lap. Positive rate is expected to be small (~2-3%
-of laps), so this is trained with LightGBM's built-in class weighting
+PitInTime set on this lap. Positive rate is small (~3.5% of laps on the
+2022-2026 data), so this is trained with LightGBM's built-in class weighting
 rather than resampling.
 
 --- Causal-confusion audit (de Haan et al., "Causal Confusion in

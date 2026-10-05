@@ -8,16 +8,18 @@ project's scope guardrail.
 Formulation follows Carrasco Heine et al. 2022, "On the optimization of pit
 stop strategies via dynamic programming": state = (current compound, tyre
 age, set of compounds used so far), transition each lap = stay out vs. pit
-into another compound, objective = minimize total race time subject to
-using at least two distinct compounds (the mandatory two-compound rule).
+onto a fresh set of any compound (including the one already fitted, so
+e.g. MEDIUM -> HARD -> HARD is reachable), objective = minimize total race
+time subject to using at least two distinct compounds (the mandatory
+two-compound rule, enforced on the final mask rather than per stop).
 
 Degradation now comes from the trained ML model (03_ml_degradation_model.py's
 LightGBM, loaded dynamically since notebook filenames can't be `import`ed
 normally), not the per-race linear regression this file originally used --
 that per-race-only fit couldn't capture non-linear/cliff wear and had to
 be refit independently for every race with no pooling. The ML model pools
-across all 103 races/circuits (leave-one-circuit-out validated,
-~0.72s MAE) and is queried via a precomputed per-race (compound, lap,
+across every race/circuit pulled (leave-one-circuit-out validated,
+~0.73s MAE) and is queried via a precomputed per-race (compound, lap,
 tyre age) grid -- build_ml_pace_lookup() in 03 -- rather than per-state
 model.predict() calls, since the DP explores thousands of states. Uses
 the race's own real historical weather (legitimate for replaying a
@@ -105,8 +107,6 @@ def solve_dp(n_laps: int, field_pace: pd.Series, degradation: dict, pit_loss: fl
                 if new_cost < new_states.get(key, (INF, None))[0]:
                     new_states[key] = (new_cost, path)
             for c2 in compounds:
-                if c2 == c:
-                    continue
                 ep2 = expected_pace(lap, c2, 1)
                 if ep2 is None:
                     continue
@@ -127,10 +127,10 @@ def solve_dp(n_laps: int, field_pace: pd.Series, degradation: dict, pit_loss: fl
 def replay_actual(driver_laps: pd.DataFrame, field_pace: pd.Series, degradation: dict, pit_loss: float):
     """Cost of a driver's real stint sequence, evaluated through the same
     expected-pace model the DP uses -- not their real lap times."""
+    driver_laps = driver_laps.sort_values('LapNumber')
     total = 0.0
-    n_pits = 0
     compounds_used = set()
-    for _, row in driver_laps.sort_values('LapNumber').iterrows():
+    for _, row in driver_laps.iterrows():
         compound, age, lap = row['Compound'], row['TyreLife'], row['LapNumber']
         if compound not in degradation or pd.isna(age):
             return None
@@ -143,10 +143,21 @@ def replay_actual(driver_laps: pd.DataFrame, field_pace: pd.Series, degradation:
             return None
         total += fp + rel_pace
         compounds_used.add(compound)
-        if row['LapNumber'] > 1 and age == 1:
-            n_pits += 1
     if len(compounds_used) < 2:
         return None
+    # A stop = the tyre set actually changed: a different compound, or tyre
+    # age that didn't just carry on from the previous lap. Not TyreLife
+    # resetting to 1 -- TyreLife counts laps from earlier sessions, so a stop
+    # onto a used set (e.g. scrubbed quali softs) starts above 1. And not
+    # Stint changes -- FastF1 opens a new stint on every pit-lane pass,
+    # including drive-throughs and red-flag stoppages where the set stays on.
+    # A change made under a red flag ('5') is free, the race being suspended,
+    # so it isn't charged pit loss.
+    prev = driver_laps.shift()
+    new_set = ((driver_laps['Compound'] != prev['Compound'])
+               | (driver_laps['TyreLife'] - prev['TyreLife'] != driver_laps['LapNumber'] - prev['LapNumber']))
+    under_red_flag = prev['TrackStatus'].astype(str).str.contains('5')
+    n_pits = int((new_set & ~under_red_flag).iloc[1:].sum())
     total += n_pits * pit_loss
     return {'cost': total, 'n_pits': n_pits, 'compounds': compounds_used}
 
@@ -179,7 +190,7 @@ def main():
         # Eligibility: was this compound genuinely used in this race at all
         # (not just a formation-lap fluke)? Unlike the old per-race linear
         # fit, the ML model doesn't need many laps *from this race* to
-        # predict reliably -- it pools across all 103 races -- so this is a
+        # predict reliably -- it pools across every race -- so this is a
         # much lighter bar (>=5 laps) than the >=30 the linear version
         # needed to avoid noisy per-race slopes. The Emilia Romagna 2022
         # 6-stop sanity-check failure that originally motivated that gate
@@ -211,19 +222,30 @@ def main():
             print(f"  [{team}] pit loss {pit_loss:.1f}s -- DP hindsight-optimal: {dp['cost']:.1f}s, "
                   f"{len(dp['stops'])} stop(s): {stop_str}")
 
+            # A lapped driver's actual cost only covers the laps they drove,
+            # so they're compared against the DP optimum over that same
+            # distance (each lap ~90s, so a full-distance optimum would make
+            # any lapped driver's real strategy look better than optimal).
+            dp_by_distance = {n_laps: dp}
             deltas = []
             for driver, driver_laps in team_laps.groupby('Driver'):
-                if driver_laps['LapNumber'].max() < n_laps - 2:
-                    continue  # retired before the finish -- not comparable to a full-distance DP total
+                driver_n_laps = int(driver_laps['LapNumber'].max())
+                if driver_n_laps < n_laps - 2:
+                    continue  # retired, not lapped -- a partial race isn't a strategy to evaluate
+                if driver_n_laps not in dp_by_distance:
+                    dp_by_distance[driver_n_laps] = solve_dp(driver_n_laps, field_pace, degradation, pit_loss)
+                driver_dp = dp_by_distance[driver_n_laps]
+                if driver_dp is None:
+                    continue
                 actual = replay_actual(driver_laps, field_pace, degradation, pit_loss)
                 if actual is None:
                     continue
-                delta = actual['cost'] - dp['cost']
+                delta = actual['cost'] - driver_dp['cost']
                 deltas.append(delta)
                 rows.append({
                     'race': race_id, 'event': event_name, 'driver': driver, 'team': team,
-                    'n_laps': n_laps, 'team_pit_loss_s': pit_loss,
-                    'dp_optimal_s': dp['cost'], 'dp_n_stops': len(dp['stops']),
+                    'n_laps': n_laps, 'driver_n_laps': driver_n_laps, 'team_pit_loss_s': pit_loss,
+                    'dp_optimal_s': driver_dp['cost'], 'dp_n_stops': len(driver_dp['stops']),
                     'actual_s': actual['cost'], 'actual_n_pits': actual['n_pits'],
                     'delta_s': delta,
                 })

@@ -8,6 +8,12 @@ pit-loss logic from 00_explore_one_race.py -- that logic lives in
 02_fixed_degradation_pitloss.py and 03_ml_degradation_model.py, which
 read from this Bronze layer.
 
+Also lands, per round, the official drivers'/constructors' championship
+standings after that round and (on sprint weekends) the sprint results,
+from Jolpica (the Ergast successor) via FastF1's built-in client. These
+feed 07_championship_rivals.py: summing race-session points alone misses
+sprint points and any official adjustments.
+
 Idempotent: already-written races are skipped, so re-running after adding
 a new season only pulls what's missing. Races without a completed race
 session yet (future rounds) fail gracefully and are reported, not fatal.
@@ -16,9 +22,11 @@ Run with: python notebooks/01_pull_bronze_data.py
 """
 import fastf1
 import pandas as pd
+from fastf1.ergast import Ergast
 from pathlib import Path
 
 fastf1.Cache.enable_cache('data/fastf1_cache')
+ergast = Ergast(result_type='pandas', auto_cast=True, limit=100)
 
 YEARS = [2022, 2023, 2024, 2025, 2026]
 BRONZE_DIR = Path('data/bronze')
@@ -31,7 +39,40 @@ LAP_COLS = [
     'IsPersonalBest', 'DeletedReason',
 ]
 
-RESULT_COLS = ['Abbreviation', 'DriverNumber', 'TeamName', 'Position', 'ClassifiedPosition', 'Points', 'Status']
+RESULT_COLS = ['Abbreviation', 'DriverNumber', 'DriverId', 'TeamName', 'TeamId',
+               'Position', 'ClassifiedPosition', 'Points', 'Status']
+
+# DriverId/constructorId are the same Ergast-style ids as FastF1's
+# DriverId/TeamId result columns above, which is how 07 joins them.
+DRIVER_STANDING_COLS = ['position', 'points', 'driverId', 'driverCode']
+CONSTRUCTOR_STANDING_COLS = ['position', 'points', 'constructorId', 'constructorName']
+SPRINT_COLS = ['position', 'points', 'driverId', 'driverCode', 'constructorId']
+
+
+def pull_standings(year: int, rnd: int, is_sprint_weekend: bool) -> str:
+    """Official standings after this round (+ sprint results if any).
+    Writes nothing for a round Jolpica has no data for yet, so it's
+    retried on the next run rather than cached as empty."""
+    race_id = f"{year}_r{rnd:02d}"
+    drivers_path = BRONZE_DIR / f"{race_id}_standings_drivers.parquet"
+    teams_path = BRONZE_DIR / f"{race_id}_standings_constructors.parquet"
+    sprint_path = BRONZE_DIR / f"{race_id}_sprint.parquet"  # not *_results: that glob means race results
+    if drivers_path.exists() and teams_path.exists() and (sprint_path.exists() or not is_sprint_weekend):
+        return 'standings cached'
+
+    drivers = ergast.get_driver_standings(season=year, round=rnd).content
+    teams = ergast.get_constructor_standings(season=year, round=rnd).content
+    if not drivers or not teams:
+        return 'no standings yet'
+    if is_sprint_weekend:
+        sprint = ergast.get_sprint_results(season=year, round=rnd).content
+        if not sprint:
+            return 'no sprint results yet'
+        sprint[0][SPRINT_COLS].assign(Year=year, RoundNumber=rnd).to_parquet(sprint_path, index=False)
+    drivers[0][DRIVER_STANDING_COLS].assign(Year=year, RoundNumber=rnd).to_parquet(drivers_path, index=False)
+    teams[0][CONSTRUCTOR_STANDING_COLS].assign(Year=year, RoundNumber=rnd).to_parquet(teams_path, index=False)
+    return 'standings written'
+
 
 results = []
 for year in YEARS:
@@ -40,6 +81,12 @@ for year in YEARS:
 
     for _, event in schedule.iterrows():
         rnd, name = event['RoundNumber'], event['EventName']
+        try:
+            standings_status = pull_standings(year, rnd, 'sprint' in str(event['EventFormat']))
+        except Exception as e:
+            standings_status = f'standings FAILED - {e}'
+        print(f"[{year} r{rnd:2d}] {name}: {standings_status}")
+
         out_path = BRONZE_DIR / f"{year}_r{rnd:02d}_laps.parquet"
         if out_path.exists():
             print(f"[{year} r{rnd:2d}] {name}: already cached, skipping")

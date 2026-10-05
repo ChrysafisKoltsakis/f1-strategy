@@ -154,7 +154,7 @@ def load_risk_context(race_id: str):
     knowable before the race starts: the ML degradation lookup for this
     race's circuit/weather, the circuit's green + SC/VSC pit-loss
     constants (team-adjusted), and the population-level SC/VSC recurrence
-    stats (pooled across all 103 races, so there's no per-race leakage in
+    stats (pooled across every race, so there's no per-race leakage in
     querying them here). Returns None if this race's pit-loss estimate was
     rejected as implausible (02_fixed_degradation_pitloss.py's
     MIN_PLAUSIBLE_GREEN_PIT_LOSS floor) -- same races the batch tools
