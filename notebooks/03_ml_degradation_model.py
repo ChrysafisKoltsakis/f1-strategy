@@ -24,8 +24,14 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import joblib
+import importlib.util
 from pathlib import Path
 from sklearn.metrics import mean_absolute_error
+
+_spec = importlib.util.spec_from_file_location(
+    'degradation_pitloss_lib', Path(__file__).parent / '02_fixed_degradation_pitloss.py')
+dpl = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dpl)
 
 BRONZE_DIR = Path('data/bronze')
 SILVER_DIR = Path('data/silver')
@@ -97,15 +103,117 @@ def build_silver_dataset() -> pd.DataFrame:
         clean = pd.merge_asof(clean, weather[['Time', 'AirTemp', 'TrackTemp', 'Humidity', 'Rainfall']],
                                on='Time', direction='nearest')
 
+        clean['race'] = race_id  # lets 12_as_of_context.py train on earlier races only
+        clean['Circuit'] = dpl.circuit_of(race_id)   # not EventName: see 02's circuit_of
+        for flag, v in dpl.era_flags(race_id).items():
+            clean[flag] = v
         rows.append(clean[[
-            'Driver', 'LapNumber', 'RaceProgress', 'Compound', 'TyreLife', 'Stint',
+            'race', 'Driver', 'LapNumber', 'RaceProgress', 'Compound', 'TyreLife', 'Stint',
             'LapTimeSeconds', 'RelativePace', 'AirTemp', 'TrackTemp', 'Humidity', 'Rainfall',
-            'EventName', 'RoundNumber',
+            'EventName', 'Circuit', 'RoundNumber', *dpl.era_flags(race_id),
         ]])
 
     silver = pd.concat(rows, ignore_index=True)
     silver.to_parquet(SILVER_DIR / 'laps_ml_features.parquet', index=False)
     return silver
+
+
+FEATURE_COLS = ['TyreLife', 'RaceProgress', 'Compound', 'AirTemp', 'TrackTemp',
+                'Humidity', 'Rainfall', 'Stint', 'Circuit',
+                'Regs2022']  # regulation-era flag, see 02's era_flags
+# No Regs2026: predicting 2026 rounds 5-16 from earlier races, the model
+# without it was slightly better (MAE 1.043s vs 1.063s with it) -- pace
+# relative to the field carries across a rules change that every car
+# makes at once. 2026 still counts as its own era for usable tyre life.
+CAT_FEATURES = ['Compound', 'Circuit']
+# Seasons the model trains on (the Silver dataset keeps every season).
+TRAIN_FROM_SEASON = 2019
+
+
+# Older regulation eras are down-weighted as a fading prior: 02's
+# era_weights / PRIOR_ERA_RACES, shared with the trigger classifier.
+era_weights = dpl.era_weights
+
+
+def new_regressor() -> lgb.LGBMRegressor:
+    """Shared with 12_as_of_context.py so its as-of models match this one.
+    Pace can only get worse with tyre age (monotone constraint): the raw
+    data say otherwise late in long stints, but only because of
+    survivorship -- see shape_wear()."""
+    return lgb.LGBMRegressor(
+        n_estimators=300, learning_rate=0.05, max_depth=5,
+        num_leaves=31, min_child_samples=20, verbosity=-1,
+        monotone_constraints=[1 if f == 'TyreLife' else 0 for f in FEATURE_COLS],
+        monotone_constraints_method='advanced',
+    )
+
+
+# --- Censored tyre data -------------------------------------------------
+# Teams change tyres before they fall away, so race data never show the
+# drop-off: within stints, observed wear even SLOWS with age (long stints
+# exist only where tyres were lasting, and drivers manage pace on them), and
+# the model extrapolates gentle wear into stint lengths nobody has run -- it
+# picked a one-stop for every driver in Spain 2024, where every team
+# two-stopped. Two corrections were tried and rejected by the teammate
+# validation (13), which prices real strategies against real outcomes:
+#   - forcing non-decreasing wear within, and a drop-off beyond, the 90th
+#     percentile of stint lengths: slope 0.93 -> 0.18;
+#   - a drop-off beyond the longest stint previously run at that circuit:
+#     slope 0.47 (real stints often set new records and were fine).
+# So race data can confirm the model where teams have run a strategy but
+# can't prove an untried one would fail; that belongs to the pre-race
+# default strategy (Pirelli / history). What stays here is (1) the monotone
+# constraint in new_regressor() -- pace can't improve with tyre age; slope
+# 0.91 -- and (2) a safety net against absurd extrapolation: a drop-off
+# beyond the longest stint ever run on that compound at any circuit (slope
+# 0.87, within noise of no drop-off).
+TYRE_LIFE_MIN_STINTS = 5     # fewer stints of a compound in this era -> use every era
+CLIFF_S_PER_LAP2 = 0.05      # drop-off beyond usable life: +0.05 * (laps past it)^2 s/lap
+_STINT_LENGTHS = None
+
+
+def stint_lengths() -> pd.DataFrame:
+    """Longest tyre age reached in every dry stint (race, circuit, compound)."""
+    global _STINT_LENGTHS
+    if _STINT_LENGTHS is None:
+        s = pd.read_parquet(SILVER_DIR / 'laps_ml_features.parquet',
+                            columns=['race', 'Driver', 'Stint', 'Compound', 'TyreLife', 'Circuit'])
+        s = s[s['Compound'].isin(['SOFT', 'MEDIUM', 'HARD'])]
+        _STINT_LENGTHS = (s.groupby(['race', 'Circuit', 'Driver', 'Stint', 'Compound'], observed=True)['TyreLife']
+                          .max().reset_index())
+    return _STINT_LENGTHS
+
+
+def usable_tyre_life(circuit: str, compounds: list, before_race: str) -> dict:
+    """{compound: usable life in laps}: the longest stint run on that
+    compound at any circuit in races strictly before before_race (same
+    rules era if it has enough stints). circuit is kept so a per-circuit
+    limit -- e.g. Pirelli's published maximum stint length -- can override."""
+    st = stint_lengths()
+    st = st[st['race'] < before_race]
+    era = st[st['race'].map(dpl.era_of) == dpl.era_of(before_race)]
+    life = {}
+    for c in compounds:
+        pool = era[era['Compound'] == c]['TyreLife']
+        if len(pool) < TYRE_LIFE_MIN_STINTS:
+            pool = st[st['Compound'] == c]['TyreLife']   # thin history (early 2022): any era
+        life[c] = int(pool.max()) if len(pool) else None
+    return life
+
+
+def shape_wear(pace_by_age: np.ndarray, life: int | None) -> np.ndarray:
+    """pace_by_age[i] = predicted relative pace at tyre age i+1. Unchanged
+    up to the usable life; beyond it, the wear rate over the last 5 laps of
+    usable life continues, plus a quadratic drop-off."""
+    p = np.asarray(pace_by_age, dtype=float)
+    if life is None or life < 6 or life >= len(p):
+        return p
+    life = int(life)
+    rate = max((p[life - 1] - p[life - 6]) / 5.0, 0.0)
+    beyond = np.arange(1, len(p) - life + 1)
+    out = p.copy()
+    out[life:] = p[life - 1] + rate * beyond + CLIFF_S_PER_LAP2 * beyond ** 2
+    return out
 
 
 def train_model(silver: pd.DataFrame):
@@ -116,27 +224,24 @@ def train_model(silver: pd.DataFrame):
     the realistic test, since in production this model has to predict
     degradation at a circuit before/during that circuit's own race.
     """
-    cat_features = ['Compound', 'EventName']
-    for c in cat_features:
-        silver[c] = silver[c].astype('category')
+    for c in CAT_FEATURES:
+        silver[c] = silver[c].astype('category')  # in place: main() saves these categories with the model
+    silver = silver[silver['race'].str[:4].astype(int) >= TRAIN_FROM_SEASON]
 
-    feature_cols = ['TyreLife', 'RaceProgress', 'Compound', 'AirTemp', 'TrackTemp',
-                     'Humidity', 'Rainfall', 'Stint', 'EventName']
+    feature_cols = FEATURE_COLS
 
-    circuits = silver['EventName'].unique()
+    circuits = silver['Circuit'].unique()
     fold_errors = []
 
     for held_out in circuits:
-        train = silver[silver['EventName'] != held_out]
-        test = silver[silver['EventName'] == held_out]
+        train = silver[silver['Circuit'] != held_out]
+        test = silver[silver['Circuit'] == held_out]
         if len(test) < 30:
             continue
 
-        model = lgb.LGBMRegressor(
-            n_estimators=300, learning_rate=0.05, max_depth=5,
-            num_leaves=31, min_child_samples=20, verbosity=-1,
-        )
-        model.fit(train[feature_cols], train['RelativePace'], categorical_feature=['Compound', 'EventName'])
+        model = new_regressor()
+        model.fit(train[feature_cols], train['RelativePace'], sample_weight=era_weights(train['race']),
+                  categorical_feature=CAT_FEATURES)
         preds = model.predict(test[feature_cols])
         mae = mean_absolute_error(test['RelativePace'], preds)
         fold_errors.append((held_out, mae, len(test)))
@@ -146,11 +251,9 @@ def train_model(silver: pd.DataFrame):
     print(f"\nOverall leave-one-circuit-out MAE: {overall_mae:.3f}s")
 
     # Final model trained on everything, for extracting degradation curves / downstream use.
-    final_model = lgb.LGBMRegressor(
-        n_estimators=300, learning_rate=0.05, max_depth=5,
-        num_leaves=31, min_child_samples=20, verbosity=-1,
-    )
-    final_model.fit(silver[feature_cols], silver['RelativePace'], categorical_feature=['Compound', 'EventName'])
+    final_model = new_regressor()
+    final_model.fit(silver[feature_cols], silver['RelativePace'], sample_weight=era_weights(silver['race']),
+                    categorical_feature=CAT_FEATURES)
     return final_model, feature_cols, fold_errors
 
 
@@ -164,9 +267,9 @@ def extract_degradation_curves(model, feature_cols, silver: pd.DataFrame):
     learned rather than hand-fit per circuit.
     """
     rows = []
-    combos = silver[['EventName', 'Compound']].drop_duplicates()
+    combos = silver[['Circuit', 'Compound']].drop_duplicates()
     for _, combo in combos.iterrows():
-        sub = silver[(silver['EventName'] == combo['EventName']) & (silver['Compound'] == combo['Compound'])]
+        sub = silver[(silver['Circuit'] == combo['Circuit']) & (silver['Compound'] == combo['Compound'])]
         if len(sub) < 10:
             continue
 
@@ -176,13 +279,14 @@ def extract_degradation_curves(model, feature_cols, silver: pd.DataFrame):
         query = pd.DataFrame({'TyreLife': tyre_range})
         for col, val in template.items():
             query[col] = val
+        query['Regs2022'], query['Regs2026'] = 1, 0  # curves describe the 2022-2025 rules (most data)
         query['Compound'] = pd.Categorical([combo['Compound']] * len(query), categories=silver['Compound'].cat.categories)
-        query['EventName'] = pd.Categorical([combo['EventName']] * len(query), categories=silver['EventName'].cat.categories)
+        query['Circuit'] = pd.Categorical([combo['Circuit']] * len(query), categories=silver['Circuit'].cat.categories)
 
         preds = model.predict(query[feature_cols])
         slope = np.polyfit(tyre_range, preds, 1)[0]
         rows.append({
-            'circuit': combo['EventName'], 'compound': combo['Compound'],
+            'circuit': combo['Circuit'], 'compound': combo['Compound'],
             'n_laps_observed': len(sub), 'implied_slope_s_per_lap': slope,
             'pred_at_tyre_5': preds[4] if len(preds) > 4 else None,
             'pred_at_tyre_20': preds[19] if len(preds) > 19 else None,
@@ -221,12 +325,9 @@ def build_ml_pace_lookup(race_id: str, bundle: dict, compounds: list) -> dict:
     observed median stint (the same partial-dependence-style
     simplification extract_degradation_curves() already uses for
     circuit-level curves, just applied per-race here instead)."""
-    model, feature_cols = bundle['model'], bundle['feature_cols']
-    compound_categories, event_categories = bundle['compound_categories'], bundle['event_categories']
-
     laps = pd.read_parquet(BRONZE_DIR / f"{race_id}_laps.parquet")
     n_laps = int(laps['LapNumber'].max())
-    event_name = laps['EventName'].iloc[0]
+    circuit = dpl.circuit_of(race_id)
     median_stint = laps['Stint'].median() if laps['Stint'].notna().any() else 1.0
 
     weather = pd.read_parquet(BRONZE_DIR / f"{race_id}_weather.parquet").sort_values('Time')
@@ -234,9 +335,22 @@ def build_ml_pace_lookup(race_id: str, bundle: dict, compounds: list) -> dict:
     lap_weather = pd.merge_asof(lap_times, weather[['Time', 'AirTemp', 'TrackTemp', 'Humidity', 'Rainfall']],
                                  on='Time', direction='nearest').set_index('LapNumber')
 
-    valid_compounds = [c for c in compounds if c in compound_categories]
-    if event_name not in event_categories:
+    if circuit not in bundle['circuit_categories']:
         return {}  # circuit never seen in training -- caller should fall back
+    return predict_pace_grid(bundle, circuit, n_laps, lap_weather, median_stint, compounds, dpl.era_flags(race_id),
+                             usable_tyre_life(circuit, compounds, before_race=race_id))
+
+
+def predict_pace_grid(bundle: dict, circuit: str, n_laps: int, lap_weather: pd.DataFrame,
+                      median_stint: float, compounds: list, regs: dict, life: dict | None = None) -> dict:
+    """The batched (compound, lap, tyre age) prediction behind
+    build_ml_pace_lookup(), given per-lap weather (indexed by lap number).
+    A circuit the model never saw is predicted with a missing circuit
+    category, i.e. from the other features alone -- 12_as_of_context.py
+    needs that for a circuit's first visit."""
+    model, feature_cols = bundle['model'], bundle['feature_cols']
+    compound_categories, circuit_categories = bundle['compound_categories'], bundle['circuit_categories']
+    valid_compounds = [c for c in compounds if c in compound_categories]
 
     grid_rows = []
     for compound in valid_compounds:
@@ -250,26 +364,29 @@ def build_ml_pace_lookup(race_id: str, bundle: dict, compounds: list) -> dict:
                     'TyreLife': age, 'RaceProgress': lap / n_laps,
                     'AirTemp': w['AirTemp'], 'TrackTemp': w['TrackTemp'],
                     'Humidity': w['Humidity'], 'Rainfall': w['Rainfall'],
-                    'Stint': median_stint,
+                    'Stint': median_stint, **regs,
                 })
     if not grid_rows:
         return {}
 
     grid = pd.DataFrame(grid_rows)
     grid['Compound'] = pd.Categorical(grid['compound'], categories=compound_categories)
-    grid['EventName'] = pd.Categorical([event_name] * len(grid), categories=event_categories)
+    grid['Circuit'] = pd.Categorical([circuit] * len(grid), categories=circuit_categories)
     preds = model.predict(grid[feature_cols])
 
+    grid['pred'] = preds
     lookup = {c: {} for c in valid_compounds}
-    for (lap, compound, age), pred in zip(zip(grid['lap'], grid['compound'], grid['age']), preds):
-        lookup[compound][(lap, age)] = float(pred)
+    for (compound, lap), g in grid.groupby(['compound', 'lap']):
+        shaped = shape_wear(g.sort_values('age')['pred'].values, (life or {}).get(compound))
+        for age, v in zip(sorted(g['age']), shaped):
+            lookup[compound][(lap, age)] = float(v)
     return lookup
 
 
 def main():
     print("Building Silver-layer ML feature dataset from all cached races...")
     silver = build_silver_dataset()
-    print(f"  {len(silver)} clean laps across {silver['EventName'].nunique()} circuits\n")
+    print(f"  {len(silver)} clean laps across {silver['Circuit'].nunique()} circuits\n")
 
     print("Training LightGBM with leave-one-circuit-out cross-validation:")
     model, feature_cols, fold_errors = train_model(silver)
@@ -290,7 +407,7 @@ def main():
     joblib.dump({
         'model': model, 'feature_cols': feature_cols,
         'compound_categories': silver['Compound'].cat.categories.tolist(),
-        'event_categories': silver['EventName'].cat.categories.tolist(),
+        'circuit_categories': silver['Circuit'].cat.categories.tolist(),
     }, 'data/models/degradation_model.joblib')
     print("Saved data/models/degradation_model.joblib")
 

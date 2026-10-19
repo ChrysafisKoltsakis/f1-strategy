@@ -14,6 +14,12 @@ from Jolpica (the Ergast successor) via FastF1's built-in client. These
 feed 07_championship_rivals.py: summing race-session points alone misses
 sprint points and any official adjustments.
 
+Also writes data/circuits.csv (race, event, location) from FastF1's
+schedule: event names aren't circuits -- the same track runs under several
+names (Styrian/Austrian, 70th Anniversary/British, Barcelona/Spanish in
+2026) and one name can move (the 2026 Spanish GP is in Madrid) -- so 02's
+circuit_of() keys everything per-circuit off the location instead.
+
 Idempotent: already-written races are skipped, so re-running after adding
 a new season only pulls what's missing. Races without a completed race
 session yet (future rounds) fail gracefully and are reported, not fatal.
@@ -28,7 +34,13 @@ from pathlib import Path
 fastf1.Cache.enable_cache('data/fastf1_cache')
 ergast = Ergast(result_type='pandas', auto_cast=True, limit=100)
 
-YEARS = [2022, 2023, 2024, 2025, 2026]
+# 2019-2021 run on the previous (13-inch tyre, pre-ground-effect) rules,
+# kept for history -- pit loss, SC/VSC rates, and as-of models for early
+# 2022 races -- with downstream models told the era apart. FastF1 has full
+# timing data (tyres, stints, track status) from 2018; 2018 itself is left
+# out because its absolute compound names (ultrasoft, supersoft, ...) map to
+# soft/medium/hard differently at every race.
+YEARS = [2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
 BRONZE_DIR = Path('data/bronze')
 BRONZE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -75,12 +87,14 @@ def pull_standings(year: int, rnd: int, is_sprint_weekend: bool) -> str:
 
 
 results = []
+circuit_rows = []
 for year in YEARS:
     schedule = fastf1.get_event_schedule(year, include_testing=False)
     print(f"=== {year}: {len(schedule)} rounds ===")
 
     for _, event in schedule.iterrows():
         rnd, name = event['RoundNumber'], event['EventName']
+        circuit_rows.append({'race': f"{year}_r{rnd:02d}", 'event': name, 'location': event['Location']})
         try:
             standings_status = pull_standings(year, rnd, 'sprint' in str(event['EventFormat']))
         except Exception as e:
@@ -121,6 +135,8 @@ for year in YEARS:
         except Exception as e:
             print(f"[{year} r{rnd:2d}] {name}: FAILED - {e}")
             results.append((year, rnd, name, f'FAILED: {e}'))
+
+pd.DataFrame(circuit_rows).to_csv('data/circuits.csv', index=False)
 
 print("\n--- Summary ---")
 for year, rnd, name, status in results:

@@ -1,0 +1,43 @@
+# Pirelli's published pre-race strategy prediction for each race (the one it
+# lists first / calls fastest on paper), collected by hand on 2026-10-19 from
+# Pirelli's Saturday team notes and press coverage quoting them. Read by
+# notebooks/14_default_strategy.py.
+#   compounds:    planned sequence, dash-separated (start compound first)
+#   stop_windows: in-lap window per stop, 'lo-hi' separated by ';'. Blank =
+#                 Pirelli gave the sequence but no laps (stops then spread
+#                 evenly over the race).
+# Covers the pinned test races (2025_r20 onwards). Wet races (2026_r05
+# Canada, 2026_r16 Bahrain/Sepang) left out. Not found: 2026_r02 China
+# (no race-strategy prediction located), so it falls back to history.
+# Notes per race:
+#   2025_r20  Pirelli listed Medium-Soft (42-48) first; Medium-Hard 26-32 also given
+#   2025_r23  25-lap-per-set cap forced 2 stops; Pirelli gave only the second
+#             window (44-50) for M-M-S and said teams would use the full 25 laps,
+#             so the first window is taken from its M-H-S option (19-25)
+#   2026_r03  Pirelli gave Soft-Hard 13-19 and said Medium-Hard pits two laps
+#             later; the 15-21 window is inferred from that
+#   2026_r06  secondary source reproducing Pirelli's graphic
+#   2026_r08  sources disagree on one vs two stops; this is the two-stop
+#             route given with windows
+#   2026_r10  windows from F1's strategy charts as reproduced by Formula Live Pulse
+#   2026_r11  Pirelli rated one- and two-stop level on time; the one-stop is used
+#   2026_r14  Madrid debut; Pirelli said Medium-Hard one-stop but gave no window
+race,compounds,stop_windows,source
+2025_r20,MEDIUM-SOFT,42-48,https://www.pitpass.com/81424/Mexico-City-Grand-Prix-Qualifying-team-notes-Pirelli
+2025_r21,SOFT-MEDIUM,24-30,https://www.pitpass.com/81513/Sao-Paulo-Grand-Prix-Sprint-Qualifying-team-notes-Pirelli
+2025_r22,MEDIUM-HARD,20-26,https://www.racefans.net/2025/11/22/2025-las-vegas-grand-prix-strategy-briefing-all-the-data-to-follow-the-race-with/
+2025_r23,MEDIUM-MEDIUM-SOFT,19-25;44-50,https://www.pitpass.com/81716/Qatar-Grand-Prix-Sprint-Qualifying-team-notes-Pirelli
+2025_r24,MEDIUM-HARD,20-26,https://www.pitpass.com/81798/Abu-Dhabi-Grand-Prix-Qualifying-team-notes-Pirelli
+2026_r01,MEDIUM-HARD,20-26,https://www.f1technical.net/news/28296
+2026_r03,MEDIUM-HARD,15-21,https://www.f1technical.net/news/28391
+2026_r04,MEDIUM-HARD,22-28,https://www.f1technical.net/news/28492
+2026_r06,SOFT-MEDIUM,31-37,https://coffeecornermotorsport.com/f1-monaco-grand-prix-2026-tyre-strategy/
+2026_r07,MEDIUM-HARD-HARD,15-21;38-44,https://www.autohebdof1.com/news/f1/What-strategies-for-the-Catalan-Grand-Prix.html
+2026_r08,MEDIUM-HARD-HARD,17-23;46-52,https://www.total-motorsport.com/austrian-gp-race-strategy-2026/
+2026_r09,MEDIUM-HARD,24-30,https://www.f1technical.net/news/28870
+2026_r10,MEDIUM-HARD,17-23,https://blog.f1livepulse.com/belgian-grand-prix-2026-strategy-guide-one-stop-options
+2026_r11,MEDIUM-HARD,26-32,https://scuderiafans.com/2026-hungarian-gp-tyre-strategy-pirelli-backs-ferrari-in-one-stop-vs-two-stop-battle/
+2026_r12,MEDIUM-HARD,27-33,https://www.autohebdof1.com/news/f1/What-are-the-possible-strategies-for-the-Dutch-Grand-Prix-at-Zandvoort.html
+2026_r13,MEDIUM-HARD,24-30,https://www.f1technical.net/news/29271
+2026_r14,MEDIUM-HARD,,https://www.autosport.com/f1/news/spanish-gp-strategy-options-in-madrid/10855301/
+2026_r15,MEDIUM-SOFT,26-32,https://www.autohebdof1.com/news/f1/What-are-the-possible-strategies-for-the-Azerbaijan-GP.html

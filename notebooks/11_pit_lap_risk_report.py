@@ -74,6 +74,11 @@ def main():
     green_pit_loss = float(pd.read_csv('data/pit_loss_summary.csv').set_index('race')['median_pit_loss'][race_id])
     team_adj = pd.read_csv('data/team_pit_loss_adjustment.csv').set_index('team')['adjustment_s']
     pit_loss = green_pit_loss + float(team_adj.get(team, 0.0))
+    # Same SC/VSC pricing and full-SC gap compression as 04/06.
+    ratios = bt.dpl.neutralised_pit_ratios()
+    neutral = bt.dpl.neutralisation(laps, green_pit_loss * ratios['SC'] + float(team_adj.get(team, 0.0)),
+                                    green_pit_loss * ratios['VSC'] + float(team_adj.get(team, 0.0)),
+                                    bt.dpl.sc_gap_compression())
 
     dp = pd.read_csv('data/dp_baseline_backtest.csv')
     dp_row = dp[(dp['race'] == race_id) & (dp['driver'] == driver)]
@@ -86,8 +91,8 @@ def main():
 
     rows = []
     for lap in candidates:
-        prob = dgrp.loc[dgrp['lap'] == lap, 'pred_proba_balanced'].iloc[0]
-        cost = bt.replay_strategy([lap], start_compound, n_laps, field_pace, degradation, pit_loss)
+        prob = dgrp.loc[dgrp['lap'] == lap, 'pred_proba'].iloc[0]
+        cost = bt.replay_strategy([lap], start_compound, n_laps, field_pace, degradation, pit_loss, neutral)
         rows.append({'lap': lap, 'probability': prob, 'predicted_total_s': cost})
 
     report = pd.DataFrame(rows).sort_values('probability', ascending=False).reset_index(drop=True)

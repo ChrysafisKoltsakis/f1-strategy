@@ -6,7 +6,7 @@ has (08_streaming_producer.py + 09_streaming_consumer.py) as subprocesses,
 rather than reimplementing the live loop -- so what the browser shows is
 a view onto the genuine streaming system, not a simplified stand-in for
 it. 09_streaming_consumer.py writes one JSON line per event (lap score,
-peak flag, already-acted note, risk comparison) to
+pit-window opening, per-lap cost call, SC/VSC deployment decisions) to
 data/live_events/{race_id}.jsonl; this server just launches the
 producer/consumer and tails that file over Server-Sent Events so a
 browser can watch a race replay live.
@@ -42,7 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BRONZE_DIR = PROJECT_ROOT / 'data' / 'bronze'
 LIVE_EVENTS_DIR = PROJECT_ROOT / 'data' / 'live_events'
 KAFKA_HOST, KAFKA_PORT = 'localhost', 9092
-CONSUMER_READY_TIMEOUT_S = 90
+CONSUMER_READY_TIMEOUT_S = 240  # Spark boot + first-replay as-of model training
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,15 +59,24 @@ app = FastAPI(lifespan=lifespan)
 STATE = {'race_id': None, 'consumer_proc': None, 'producer_proc': None}
 
 
+def _conditions(compounds: pd.Series) -> str:
+    """'dry', 'mixed' or 'wet' by share of laps on intermediate/wet tyres --
+    so a wet race, where the cost comparison mostly can't run, isn't picked
+    by accident."""
+    wet_share = compounds.isin(['INTERMEDIATE', 'WET']).mean()
+    return 'dry' if wet_share == 0 else 'wet' if wet_share > 0.5 else 'mixed'
+
+
 def _list_races():
     races = []
     for f in sorted(BRONZE_DIR.glob('*_laps.parquet')):
         race_id = f.stem.replace('_laps', '')
         try:
-            event_name = pd.read_parquet(f, columns=['EventName'])['EventName'].iloc[0]
+            laps = pd.read_parquet(f, columns=['EventName', 'Compound'])
+            event_name, conditions = laps['EventName'].iloc[0], _conditions(laps['Compound'])
         except Exception:
-            event_name = race_id
-        races.append({'race_id': race_id, 'event_name': event_name})
+            event_name, conditions = race_id, 'unknown'
+        races.append({'race_id': race_id, 'event_name': event_name, 'conditions': conditions})
     races.sort(key=lambda r: r['race_id'], reverse=True)
     return races
 
@@ -230,6 +239,11 @@ PAGE = r"""<!doctype html>
   .card.pit-now { background: #ffe9e0; border-color: #e07a4f; }
   .card.wait { background: #e6f0ff; border-color: #5b8def; }
   .card.acted { background: #f0f0f0; color: #666; }
+  .card.neutral { background: #fff8db; border-color: #d4a72c; }
+  .card.plan { border-left: 4px solid #2e9e5b; }
+  .card.plan.pit-now { background: #ffe9e0; }
+  .card.neutral table { margin-top: 0.3rem; }
+  .card.neutral td { padding: 0.05rem 0.5rem 0.05rem 0; }
   .hint { color: #888; font-size: 0.8rem; }
 </style>
 </head>
@@ -237,11 +251,13 @@ PAGE = r"""<!doctype html>
 <h1>F1 Live Pit Strategy -- Replay Viewer</h1>
 <p class="subtitle">
   Replays a real historical race through Kafka in real chronological order, at accelerated speed.
-  A trained classifier is queried lap-by-lap as events arrive -- exactly as a live system would use
-  it, with no access to laps that haven't "happened" yet. When its pit probability for a driver peaks
-  and then drops, that's flagged one lap late (a live system can only tell a value was a peak once it
-  sees the next one come in lower) and re-evaluated against the actual cost of pitting now versus
-  waiting for a possible Safety Car window later.
+  As each lap ends, a classifier trained only on earlier races predicts whether each driver pits at
+  the end of the <i>next</i> lap -- a lap ahead, using only what has happened so far. When that
+  crosses its threshold a pit window opens, and every lap the cost model weighs pitting at the end
+  of the next lap against staying out (expected race time, including later Safety Car chances).
+  Safety Car / VSC deployments trigger an immediate pit-this-lap call for every driver.
+  Green cards: the strategy policy -- follow the default pre-race plan (Pirelli's prediction, else
+  what finishers did here before) and leave it only when the cost model is clearly sure.
 </p>
 <div class="controls">
   <select id="race"></select>
@@ -252,15 +268,16 @@ PAGE = r"""<!doctype html>
   <span id="status">idle</span>
 </div>
 <div id="context"></div>
+<div id="plan" style="display:none; font-size:0.9rem; margin:-0.6rem 0 1rem 0.2rem"></div>
 <div class="columns">
   <div class="panel">
     <h2>Current state (per driver)</h2>
     <p class="hint">Updates as each driver completes a lap. Sorted alphabetically so rows don't jump around.</p>
-    <table id="driverTable"><thead><tr><th>Driver</th><th>Team</th><th>Lap</th><th>P(pit)</th><th>Tyre</th></tr></thead><tbody></tbody></table>
+    <table id="driverTable"><thead><tr><th>Driver</th><th>Team</th><th>Lap</th><th>P(pit next lap)</th><th>Tyre</th></tr></thead><tbody></tbody></table>
   </div>
   <div class="panel">
     <h2>Live recommendations</h2>
-    <p class="hint">Fires one lap after a driver's pit-probability peak. Dashed = just flagged, waiting on the cost comparison.</p>
+    <p class="hint">Pit windows open a lap ahead of the stop; each line is the cost model's call for the end of that lap. Yellow cards: SC/VSC deployments.</p>
     <div id="feed"></div>
   </div>
 </div>
@@ -269,10 +286,14 @@ let es = null;
 const drivers = {};   // driver -> {team, lap, proba, compound, tyre_age}
 const cards = {};     // "driver:lap" -> DOM node
 
+// Probabilities are calibrated (a real pit rate is ~3%), so colour relative
+// to the model's decision threshold: full colour at or above it.
+let pitThreshold = 0.5;
 function probColor(p) {
+  const x = Math.min(1, p / pitThreshold);
   const r = Math.round(255);
-  const g = Math.round(255 - p * 170);
-  const b = Math.round(255 - p * 200);
+  const g = Math.round(255 - x * 170);
+  const b = Math.round(255 - x * 200);
   return `rgb(${r},${g},${b})`;
 }
 
@@ -289,62 +310,138 @@ function renderDriverTable() {
   });
 }
 
-function addPeakCard(evt) {
-  const key = evt.driver + ':' + evt.lap;
+// Pit windows: opened when the classifier's P(pit at the end of the next
+// lap) crosses the threshold -- a lap ahead of the stop -- then one line per
+// lap with the cost model's call for the end of that lap, until the car
+// stops or the signal goes quiet.
+function addWindowCard(evt) {
   const div = document.createElement('div');
   div.className = 'card pending';
-  div.innerHTML = `<div class="head">${evt.driver} -- lap ${evt.lap}</div>` +
-    `peak was lap ${evt.peak_lap} (P=${evt.peak_proba.toFixed(2)}) -- evaluating...`;
+  div.innerHTML = `<div class="head">${evt.driver} -- pit window opens for the end of lap ${evt.lap}</div>` +
+    `<table><tbody></tbody></table>`;
   document.getElementById('feed').prepend(div);
-  cards[key] = div;
+  cards[evt.window_id] = div;
 }
 
-function resolveCard(evt, kind) {
-  const key = evt.driver + ':' + evt.lap;
-  const div = cards[key];
+function addWindowLine(evt, skipped) {
+  const div = cards[evt.window_id];
   if (!div) return;
-  div.classList.remove('pending');
-  if (kind === 'already_acted') {
-    div.classList.add('acted');
-    div.innerHTML += `<br>already pitted at the flagged lap -- no live decision left to evaluate.`;
+  div.classList.remove('pending', 'pit-now', 'wait', 'acted');
+  let call, detail;
+  if (skipped) {
+    call = 'not evaluated'; detail = evt.reason; div.classList.add('acted');
   } else {
-    div.classList.add(evt.verdict === 'pit NOW' ? 'pit-now' : 'wait');
-    const discountNote = evt.sc_active_now ? 'SC/VSC active -- discounted' : 'green flag -- full price';
-    div.innerHTML += `<br>pit now (${discountNote}): <b>${evt.pit_now_s.toFixed(1)}s</b> &nbsp;|&nbsp; ` +
-      `wait (worst): ${evt.wait_worst_s.toFixed(1)}s &nbsp;|&nbsp; ` +
-      `wait (SC again, P=${Math.round(evt.p_again*100)}%): ${evt.wait_best_s.toFixed(1)}s &nbsp;|&nbsp; ` +
-      `expected wait: ${evt.expected_wait_s.toFixed(1)}s` +
-      `<br><b>${evt.verdict}</b> looks better by ${Math.abs(evt.diff_s).toFixed(1)}s on expectation`;
+    call = evt.too_close ? 'too close' : evt.verdict === 'pit NOW' ? 'PIT' : 'stay out';
+    detail = `${evt.verdict === 'pit NOW' ? 'pit' : 'stay out'} better by ${Math.abs(evt.diff_s).toFixed(1)}s` +
+      (evt.sc_active_now ? ` (${evt.kind_now} out -- cheap stop)` : '') +
+      ` | P(SC/VSC before the end) ${Math.round(evt.p_sc_before_end*100)}%`;
+    div.classList.add(evt.too_close ? 'acted' : evt.verdict === 'pit NOW' ? 'pit-now' : 'wait');
   }
+  div.querySelector('tbody').innerHTML +=
+    `<tr><td>end of lap ${evt.lap}</td><td>P=${(evt.proba ?? 0).toFixed(2)}</td><td><b>${call}</b></td><td>${detail}</td></tr>`;
+}
+
+// Policy calls: one card per driver per planned stop, one line per lap
+// from the window opening until the car stops.
+const planCards = {};
+function addPlanLine(evt) {
+  const key = `${evt.driver}-plan-${evt.stop_index}`;
+  let div = planCards[key];
+  if (!div) {
+    div = document.createElement('div');
+    div.className = 'card plan';
+    div.innerHTML = `<div class="head">${evt.driver} -- plan: stop ${evt.stop_index + 1} at the end of lap ${evt.planned_lap} ` +
+      `(window ${evt.window[0]}-${evt.window[1]})</div><table><tbody></tbody></table>`;
+    document.getElementById('feed').prepend(div);
+    planCards[key] = div;
+  }
+  div.classList.toggle('pit-now', evt.pit);
+  div.querySelector('tbody').innerHTML +=
+    `<tr><td>end of lap ${evt.lap}</td><td><b>${evt.pit ? 'PIT' : 'stay out'}</b></td><td>${evt.reason}</td></tr>`;
+}
+
+// SC/VSC deployments: one card per deployment, one line per driver --
+// "pit at the end of this lap, or stay out?", decided the moment it's
+// deployed rather than a lap later when lap records arrive.
+const neutralCards = {};
+function addNeutralCard(evt) {
+  const div = document.createElement('div');
+  div.className = 'card neutral';
+  div.innerHTML = `<div class="head">${evt.kind} deployed -- race-control lap ${evt.lap}</div>` +
+    `Pit at the end of this lap, or stay out? (expected race time, incl. later SC/VSC chances)` +
+    `<table><tbody></tbody></table>`;
+  document.getElementById('feed').prepend(div);
+  neutralCards[evt.event_id] = {div, rows: []};
+}
+function addNeutralLine(evt, skipped) {
+  const c = neutralCards[evt.event_id];
+  if (!c) return;
+  const call = skipped ? 'not evaluated' : (evt.too_close ? 'too close' : evt.verdict);
+  const detail = skipped ? evt.reason : `${evt.verdict === 'pit NOW' ? 'pit' : 'stay out'} better by ${Math.abs(evt.diff_s).toFixed(1)}s` +
+    ` -- policy: <b>${evt.policy_pit ? 'PIT' : 'stay out'}</b>`;
+  const order = skipped ? 3 : evt.too_close ? 1 : evt.verdict === 'pit NOW' ? 0 : 2;
+  c.rows.push({order, html: `<tr><td><b>${evt.driver}</b></td><td>lap ${evt.lap}</td><td><b>${call}</b></td><td>${detail}</td></tr>`});
+  c.rows.sort((a, b) => a.order - b.order);
+  c.div.querySelector('tbody').innerHTML = c.rows.map(r => r.html).join('');
 }
 
 function onEvent(evt) {
   if (evt.type === 'context') {
+    if (evt.pit_threshold) pitThreshold = evt.pit_threshold;
     const c = document.getElementById('context');
     c.style.display = 'block';
     c.innerHTML = `<b>${evt.event_name}</b> (${evt.race_id}) -- ${evt.n_laps} laps. ` +
+      `Models trained on the ${evt.n_prior_races} races before this one only` +
+      (evt.pit_threshold ? `, pit window opens when P(pit at the end of the next lap) reaches ${evt.pit_threshold.toFixed(2)}` : '') +
+      (evt.thin_history ? ` <b>-- little history yet, treat recommendations as unreliable</b>` : '') + `. ` +
       (evt.compounds_modeled && evt.compounds_modeled.length
-        ? `Compounds modeled: ${evt.compounds_modeled.join(', ')}. Green pit loss ${evt.green_pit_loss.toFixed(1)}s, ` +
-          `SC/VSC pit loss ${evt.sc_pit_loss.toFixed(1)}s.`
-        : `No usable pit-loss estimate for this race -- recommendations will show probability only, no cost comparison.`);
+        ? `Pit loss: green ${evt.green_pit_loss.toFixed(1)}s, SC ${evt.sc_pit_loss.toFixed(1)}s, VSC ${(evt.vsc_pit_loss ?? evt.sc_pit_loss).toFixed(1)}s ` +
+          `(${evt.pit_loss_source})` +
+          (evt.circuit_seen ? '.' : `; tyre model has never seen this circuit.`)
+        : `No tyre/pit-loss history before this race -- recommendations will show probability only, no cost comparison.`);
+  } else if (evt.type === 'plan') {
+    const p = document.getElementById('plan');
+    p.style.display = 'block';
+    p.innerHTML = `<b>Default plan:</b> ${evt.stops.length} stop(s), ${evt.compounds.join(' &rarr; ')}, ` +
+      evt.stops.map((s, i) => `stop ${i + 1} lap ${s} (window ${evt.windows[i][0]}-${evt.windows[i][1]})`).join(', ') +
+      ` <span class="hint">-- ${evt.source}</span>`;
+  } else if (evt.type === 'plan_call') {
+    addPlanLine(evt);
+  } else if (evt.type === 'plan_update') {
+    const div = document.createElement('div');
+    div.className = 'card plan';
+    div.innerHTML = `<div class="head">${evt.driver} -- re-planned at lap ${evt.lap}</div>` +
+      `stops ${evt.old.length ? evt.old.join(', ') : 'none'} &rarr; <b>${evt.new.length ? evt.new.join(', ') : 'none'}</b> ` +
+      `<span class="hint">(position model: expected points vs the rival, against a forecast of the field)</span>`;
+    document.getElementById('feed').prepend(div);
+  } else if (evt.type === 'error') {
+    document.getElementById('status').textContent = evt.message;
   } else if (evt.type === 'ready') {
     document.getElementById('status').textContent = 'live -- waiting for laps';
   } else if (evt.type === 'lap_score') {
     drivers[evt.driver] = {team: evt.team, lap: evt.lap, proba: evt.proba, compound: evt.compound, tyre_age: evt.tyre_age};
     renderDriverTable();
-  } else if (evt.type === 'peak_flag') {
-    addPeakCard(evt);
-  } else if (evt.type === 'already_acted') {
-    resolveCard(evt, 'already_acted');
+  } else if (evt.type === 'pit_call') {
+    addWindowCard(evt);
   } else if (evt.type === 'risk_comparison') {
-    resolveCard(evt, 'risk_comparison');
+    addWindowLine(evt, false);
+  } else if (evt.type === 'skipped') {
+    addWindowLine(evt, true);
+  } else if (evt.type === 'neutralisation') {
+    addNeutralCard(evt);
+  } else if (evt.type === 'sc_decision') {
+    addNeutralLine(evt, false);
+  } else if (evt.type === 'sc_skipped') {
+    addNeutralLine(evt, true);
   }
 }
 
 async function loadRaces() {
   const races = await (await fetch('/api/races')).json();
   const sel = document.getElementById('race');
-  sel.innerHTML = races.map(r => `<option value="${r.race_id}">${r.event_name} (${r.race_id})</option>`).join('');
+  sel.innerHTML = races.map(r => `<option value="${r.race_id}">${r.event_name} (${r.race_id})` +
+    (r.conditions === 'dry' ? '' : ` -- ${r.conditions === 'wet' ? 'WET, cost comparison mostly unavailable' : 'mixed conditions, wet laps not evaluated'}`) +
+    `</option>`).join('');
 }
 
 function connectStream(raceId) {
@@ -356,12 +453,15 @@ function connectStream(raceId) {
 document.getElementById('start').onclick = async () => {
   const race_id = document.getElementById('race').value;
   const speed_factor = parseFloat(document.getElementById('speed').value) || 100;
-  document.getElementById('status').textContent = 'starting (Spark boot takes ~15-20s)...';
+  document.getElementById('status').textContent = 'starting (Spark boot ~15-20s; a race replayed for the first time also trains its as-of models, up to a minute)...';
   Object.keys(drivers).forEach(k => delete drivers[k]);
   Object.keys(cards).forEach(k => delete cards[k]);
+  Object.keys(planCards).forEach(k => delete planCards[k]);
+  Object.keys(neutralCards).forEach(k => delete neutralCards[k]);
   document.getElementById('feed').innerHTML = '';
   document.querySelector('#driverTable tbody').innerHTML = '';
   document.getElementById('context').style.display = 'none';
+  document.getElementById('plan').style.display = 'none';
   const res = await fetch('/api/start', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({race_id, speed_factor}),

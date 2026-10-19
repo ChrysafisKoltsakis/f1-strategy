@@ -46,6 +46,84 @@ STARTING_FUEL_KG = 110
 FUEL_EFFECT_S_PER_KG = 0.03
 VALID_COMPOUNDS = {'SOFT', 'MEDIUM', 'HARD', 'INTERMEDIATE', 'WET'}
 
+# Everything per-circuit (pit loss, tyre model, SC rates, default plans) is
+# keyed by circuit, not event name: Styrian/Austrian, 70th Anniversary/
+# British, Brazilian/Sao Paulo, Mexican/Mexico City and 2026's Barcelona GP/
+# earlier Spanish GPs are the same tracks, while the 2026 Spanish GP is a
+# new one (Madrid) and the 2026 Bahrain GP ran in Kuala Lumpur. FastF1's
+# schedule location (01 writes it to data/circuits.csv) identifies the
+# track, once its own renames are merged; the Sakhir GP used Bahrain's outer
+# loop, a different lap.
+# Regulation eras, by first season: 2022 (ground-effect cars, 18-inch
+# tyres) and 2026 (new chassis and power-unit rules, narrower tyres). Used
+# for era-matched usable tyre life (03) and default-plan history (14), and
+# by the models as flags (era_flags) and a fading prior over older eras
+# (era_weights).
+ERA_STARTS = (2022, 2026)
+# Once races of a new era are in the training data, everything before it
+# together counts as this many new-era races, however many it really is: a
+# fixed-strength prior that new data progressively outweighs. None = no
+# down-weighting. 2022: k = 10 was best or within noise of best for both
+# the tyre model and the trigger classifier, against 0, 5, 20 and none.
+# 2026: predicting rounds 5-16 from earlier races, any down-weighting made
+# both models worse (classifier average precision 0.096 at k = 5 rising to
+# 0.135 with none; tyre-model MAE best with none), and neither model gains
+# from a 2026 flag -- plausibly because both work relative to the field
+# (pace vs the field median; gaps, positions, tyre ages), which a rules
+# change every car makes at once mostly leaves alone.
+PRIOR_ERA_RACES = {2022: 10, 2026: None}
+
+
+def era_of(race_id: str) -> int:
+    """First season of the regulation era a race belongs to (2019 = pre-2022)."""
+    year = int(race_id[:4])
+    return max([2019] + [e for e in ERA_STARTS if year >= e])
+
+
+def era_flags(race_id: str) -> dict:
+    """{'Regs2022': 0/1, 'Regs2026': 0/1} -- the model features."""
+    year = int(race_id[:4])
+    return {f'Regs{e}': int(year >= e) for e in ERA_STARTS}
+
+
+def era_weights(race_ids: pd.Series, prior_races: dict | None = None) -> np.ndarray:
+    """Per-row training weights implementing PRIOR_ERA_RACES, nested: for
+    each era whose races are in the data, all rows before it are scaled
+    so they total k races' worth (counting each earlier race at the
+    weight it already has, so pre-2022 stays down-weighted within the
+    pre-2026 block). Only relative weights matter, so a training set
+    with no races of the newest era is left as it was."""
+    prior_races = PRIOR_ERA_RACES if prior_races is None else prior_races
+    races = race_ids.astype(str).values
+    years = np.array([int(r[:4]) for r in races])
+    w = np.ones(len(races))
+    for start in ERA_STARTS:
+        k = prior_races.get(start)
+        before = years < start
+        if k is None or not before.any() or before.all():
+            continue
+        per_race = pd.Series(w[before], index=races[before]).groupby(level=0).first()
+        w[before] *= k / per_race.sum()
+    return w
+
+
+CIRCUITS_FILE = Path('data/circuits.csv')
+LOCATION_ALIASES = {'Miami Gardens': 'Miami', 'Monte Carlo': 'Monaco', 'Marina Bay': 'Singapore',
+                    'Yas Marina': 'Yas Island'}
+EVENT_CIRCUIT_OVERRIDES = {'Sakhir Grand Prix': 'Sakhir (outer)'}
+_CIRCUITS = None
+
+
+def circuit_of(race_id: str) -> str:
+    """Canonical circuit key for a race id ('2026_r14' -> 'Madrid')."""
+    global _CIRCUITS
+    if _CIRCUITS is None:
+        c = pd.read_csv(CIRCUITS_FILE)
+        key = c['location'].replace(LOCATION_ALIASES)
+        key = c['event'].map(EVENT_CIRCUIT_OVERRIDES).fillna(key)
+        _CIRCUITS = dict(zip(c['race'], key))
+    return _CIRCUITS[race_id]
+
 
 def fuel_correct(laps: pd.DataFrame) -> pd.DataFrame:
     total_laps = laps['LapNumber'].max()
@@ -209,6 +287,147 @@ def _is_sc_or_vsc(track_status) -> bool:
     return isinstance(track_status, str) and any(c in track_status for c in '467') and '5' not in track_status
 
 
+def is_vsc_message(message) -> bool:
+    """Race-control wording changed in 2026: 'VIRTUAL SAFETY CAR DEPLOYED'
+    became 'VSC DEPLOYED', which a check for 'VIRTUAL' alone misread as a
+    full safety car (and inflated the full-SC gap compression from ~0.21 to
+    0.54, since VSCs don't bunch the field)."""
+    m = str(message).upper()
+    return 'VIRTUAL' in m or 'VSC' in m
+
+
+def neutralised_laps(laps: pd.DataFrame) -> dict:
+    """{lap: 'SC' or 'VSC'} for laps on which most of the field ran under a
+    full safety car or a virtual one (red flags excluded) -- the end of such
+    a lap is a cheap moment to pit."""
+    st = laps['TrackStatus'].astype(str)
+    flags = laps.assign(sc=st.apply(lambda s: '4' in s and '5' not in s),
+                        neut=st.apply(_is_sc_or_vsc)).groupby('LapNumber')[['sc', 'neut']].mean()
+    return {int(l): ('SC' if r['sc'] > 0.5 else 'VSC') for l, r in flags.iterrows() if r['neut'] > 0.5}
+
+
+def sc_in_laps(laps: pd.DataFrame) -> frozenset:
+    """Laps on which most of the field ran under SC or VSC."""
+    return frozenset(neutralised_laps(laps))
+
+
+SC_RATIO_MIN_STOPS = 5  # races with fewer measured SC/VSC stops don't inform the pooled ratio
+
+
+def sc_pit_loss_ratio(before_race: str | None = None) -> float:
+    """Pooled SC/VSC-to-green pit-loss ratio (both kinds together): median
+    over races with at least SC_RATIO_MIN_STOPS measured SC/VSC stops (only
+    races before `before_race`, for live use). Per-race estimates are far
+    too noisy to use directly -- from -12s to +57s, often from one or two
+    stops -- and near-zero or negative values let the hindsight DP pit on
+    every lap of a safety car for fresh tyres (up to 15 "optimal" stops)."""
+    sc = pd.read_csv('data/sc_pit_loss_summary.csv')
+    green = pd.read_csv('data/pit_loss_summary.csv')[['race', 'median_pit_loss']]
+    m = sc.merge(green, on='race', suffixes=('_sc', '_green')).dropna(subset=['median_pit_loss_sc', 'median_pit_loss_green'])
+    m = m[m['n_stops'] >= SC_RATIO_MIN_STOPS]
+    if before_race is not None:
+        m = m[m['race'] < before_race]
+    return float((m['median_pit_loss_sc'] / m['median_pit_loss_green']).median()) if len(m) else 0.5
+
+
+def sc_pit_loss_for(race_id: str, green_pit_loss: float, before_race: str | None = None) -> float:
+    """Pooled SC/VSC pit loss for a race (used live, where the kind of a
+    future neutralisation isn't known): green pit loss x the pooled ratio."""
+    return green_pit_loss * sc_pit_loss_ratio(before_race)
+
+
+def neutralised_pit_ratios(before_race: str | None = None) -> dict:
+    """{'SC': ratio, 'VSC': ratio} of pit loss to the circuit's green pit
+    loss, median over every individual measured stop of that kind (the
+    median keeps the many noisy single stops from mattering)."""
+    stops = pd.read_csv('data/neutralised_pit_stops.csv')
+    if before_race is not None:
+        stops = stops[stops['race'] < before_race]
+    ratio = stops['loss'] / stops['circuit_pit_loss']
+    return {k: float(ratio[stops['kind'] == k].median()) for k in ('SC', 'VSC')}
+
+
+def collect_sc_gap_compression(race_id: str, laps: pd.DataFrame) -> list:
+    """For each full safety car: every same-lap car's time gap to the field
+    median on the last green lap before it vs. on the restart lap. Cars that
+    pitted in between are left out (their gap moved for another reason)."""
+    rc_path = BRONZE_DIR / f"{race_id}_race_control.parquet"
+    if not rc_path.exists():
+        return []
+    rc = pd.read_parquet(rc_path)
+    sc = rc[(rc['Category'] == 'SafetyCar') & ~rc['Message'].apply(is_vsc_message)].sort_values('Time')
+    t = laps.assign(t=laps['Time'].dt.total_seconds())
+    obs, start = [], None
+    for _, r in sc.iterrows():
+        if r['Status'] == 'DEPLOYED':
+            start = r['Lap']
+        elif r['Status'] in ('ENDING', 'IN THIS LAP') and pd.notna(start) and pd.notna(r['Lap']) and start is not None:
+            before, after = int(start) - 1, int(r['Lap']) + 1
+            start = None
+            if before < 2:
+                continue
+            pitted = set(t.loc[t['LapNumber'].between(before, after) & t['PitInTime'].notna(), 'Driver'])
+            gaps = {}
+            for lap in (before, after):
+                x = t[t['LapNumber'] == lap].set_index('Driver')['t']
+                gaps[lap] = x - x.median()
+            d = pd.concat([gaps[before].rename('before'), gaps[after].rename('after')], axis=1).dropna()
+            d = d[(d['before'].abs() < 60) & ~d.index.isin(pitted)]
+            obs += [{'race': race_id, 'driver': drv, 'gap_before': v['before'], 'gap_after': v['after']}
+                    for drv, v in d.iterrows()]
+    return obs
+
+
+def sc_gap_compression(before_race: str | None = None) -> float:
+    """beta: a car's time gap to the field median after a full safety car
+    is ~beta x the gap before it (slope through the origin). Heilmeier et
+    al.'s race simulation gets the same effect from a "ghost" safety car
+    that resets gaps to ~0.8s per position; this is its statistical
+    equivalent for a model that doesn't track positions."""
+    obs = pd.read_csv('data/sc_gap_compression_obs.csv')
+    if before_race is not None:
+        obs = obs[obs['race'] < before_race]
+    return float((obs['gap_before'] * obs['gap_after']).sum() / (obs['gap_before'] ** 2).sum())
+
+
+def neutralisation(laps: pd.DataFrame, sc_price: float, vsc_price: float, beta: float) -> dict:
+    """Everything the strategy replays and the hindsight DP need to price a
+    race's real safety cars: per-lap kind, the pit price under each kind,
+    and the laps after which accumulated gaps compress by beta -- the last
+    green lap before each full-SC run, matching how both were measured:
+    beta from gaps just before deployment (cars that then pitted excluded),
+    and SC stop prices from stops made during safety cars, which already
+    include the catch-up to the queue. (Compressing at the restart instead
+    double-counted that catch-up, halving SC stops to ~2s and making the
+    hindsight DP pit twice under one safety car.)"""
+    kinds = neutralised_laps(laps)
+    compress_after = {l - 1 for l, k in kinds.items() if k == 'SC' and kinds.get(l - 1) != 'SC' and l > 1}
+    # Each consecutive run of SC (or VSC) laps is one neutralisation period.
+    period, pid = {}, -1
+    for l in sorted(kinds):
+        if not (l - 1 in kinds and kinds[l - 1] == kinds[l]):
+            pid += 1
+        period[l] = pid
+    return {'kinds': kinds, 'period': period, 'price': {'SC': sc_price, 'VSC': vsc_price},
+            'compress_after': frozenset(compress_after), 'beta': beta}
+
+
+def stop_price(neutral: dict | None, in_lap: int, green_price: float, last_cheap_period: int = -1) -> tuple:
+    """(price, last_cheap_period) for a stop at the end of in_lap. Only the
+    first stop in a neutralisation period gets that period's cheap price;
+    another stop under the same safety car pays the green price. Real
+    teams don't stop twice under one safety car -- each stop drops them down
+    the queue, a track-position cost a per-car time model doesn't see -- and
+    without the rule the hindsight DP made up to 4 stops under a single
+    Monaco safety car."""
+    if neutral is None:
+        return green_price, last_cheap_period
+    kind = neutral['kinds'].get(int(in_lap))
+    if not kind or neutral['period'][int(in_lap)] == last_cheap_period:
+        return green_price, last_cheap_period
+    return neutral['price'][kind], neutral['period'][int(in_lap)]
+
+
 def estimate_sc_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation: dict) -> dict:
     """
     Same in-lap/out-lap decomposition as estimate_pit_loss, but for stops
@@ -234,7 +453,7 @@ def estimate_sc_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation:
             return None
         return row['FieldPace'] + deg['relative_intercept'] + deg['tyre_age_slope'] * row['TyreLife']
 
-    losses = []
+    losses, stops = [], []
     for _, in_lap in in_laps.iterrows():
         match = out_laps[
             (out_laps['Driver'] == in_lap['Driver']) &
@@ -253,10 +472,29 @@ def estimate_sc_pit_loss(laps: pd.DataFrame, field_pace: pd.Series, degradation:
 
         loss = (in_lap['FuelCorrectedLapTime'] - expected_in) + (out_lap['FuelCorrectedLapTime'] - expected_out)
         losses.append(loss)
+        # Full SC ('4') and VSC ('6'/'7') save very different amounts (a
+        # calibrated Monte Carlo engine fits ~0.45 vs ~0.65 of green pit
+        # loss -- Santillana 2026), so each stop is tagged by type.
+        status = str(laps.loc[in_lap.name, 'TrackStatus'])
+        stops.append({'kind': 'SC' if '4' in status else 'VSC', 'loss': loss})
 
     if not losses:
-        return {'n_stops': 0, 'median_pit_loss': None}
-    return {'n_stops': len(losses), 'median_pit_loss': float(np.median(losses)), 'std': float(np.std(losses))}
+        return {'n_stops': 0, 'median_pit_loss': None, 'stops': []}
+    return {'n_stops': len(losses), 'median_pit_loss': float(np.median(losses)), 'std': float(np.std(losses)),
+            'stops': stops}
+
+
+MIN_TEAM_STOPS = 15
+
+
+def team_pit_loss_adjustment(stops_df: pd.DataFrame) -> pd.DataFrame:
+    """Each team's pooled median deviation from the circuit-wide pit-loss
+    constant, for teams with at least MIN_TEAM_STOPS stops. Shared with
+    12_as_of_context.py, which applies it to earlier races only."""
+    stops_df = stops_df.assign(deviation=stops_df['loss'] - stops_df['circuit_pit_loss'])
+    team_adj = stops_df.groupby('team')['deviation'].agg(['median', 'count']).reset_index()
+    team_adj.columns = ['team', 'adjustment_s', 'n_stops']
+    return team_adj[team_adj['n_stops'] >= MIN_TEAM_STOPS].sort_values('adjustment_s')
 
 
 def main():
@@ -266,6 +504,8 @@ def main():
     all_degradation_rows = []
     all_pit_loss_rows = []
     all_sc_pit_loss_rows = []
+    all_neutralised_stops = []  # per stop under SC/VSC, by kind, for the typed SC/VSC price ratios
+    all_compression_obs = []    # per car per full SC: gap to field median before vs. after
     all_stop_records = []  # per-stop (team, loss, circuit baseline) for the team-adjustment pass
 
     for f in lap_files:
@@ -284,6 +524,9 @@ def main():
         if pit_loss['median_pit_loss'] is not None:
             for r in stop_records:
                 all_stop_records.append({**r, 'race': race_id, 'circuit_pit_loss': pit_loss['median_pit_loss']})
+            for r in sc_pit_loss['stops']:
+                all_neutralised_stops.append({**r, 'race': race_id, 'circuit_pit_loss': pit_loss['median_pit_loss']})
+        all_compression_obs += collect_sc_gap_compression(race_id, laps)
 
         print(f"=== {race_id}: {event_name} ===")
         print(f"  {len(laps)} total laps -> {len(clean)} clean laps after filtering "
@@ -324,6 +567,13 @@ def main():
     print(f"Saved data/degradation_summary.csv ({len(deg_df)} rows)")
     print(f"Saved data/pit_loss_summary.csv ({len(pit_df)} rows)")
     print(f"Saved data/sc_pit_loss_summary.csv ({len(sc_pit_df)} rows)")
+    pd.DataFrame(all_neutralised_stops).to_csv('data/neutralised_pit_stops.csv', index=False)
+    pd.DataFrame(all_compression_obs).to_csv('data/sc_gap_compression_obs.csv', index=False)
+    ratios = neutralised_pit_ratios()
+    print(f"SC/VSC pit loss as a share of green (median over individual stops): SC {ratios['SC']:.2f}, "
+          f"VSC {ratios['VSC']:.2f} ({len(all_neutralised_stops)} stops)")
+    print(f"Gap compression through a full safety car: gap after = {sc_gap_compression():.2f} x gap before "
+          f"({len(all_compression_obs)} car observations)")
 
     # Team-specific pit-loss adjustment: a team's per-race stop count is far
     # too small (2 cars, 1-2 stops each) to fit a stable per-(circuit, team)
@@ -334,12 +584,11 @@ def main():
     # circuit -- giving a much bigger, more stable sample per team. Applied
     # downstream as: team_pit_loss(circuit, team) = circuit_pit_loss(circuit)
     # + team_adjustment(team).
-    MIN_TEAM_STOPS = 15
     stops_df = pd.DataFrame(all_stop_records)
-    stops_df['deviation'] = stops_df['loss'] - stops_df['circuit_pit_loss']
-    team_adj = stops_df.groupby('team')['deviation'].agg(['median', 'count']).reset_index()
-    team_adj.columns = ['team', 'adjustment_s', 'n_stops']
-    team_adj = team_adj[team_adj['n_stops'] >= MIN_TEAM_STOPS].sort_values('adjustment_s')
+    # Per-stop records too, so 12_as_of_context.py can recompute the
+    # adjustment from only the races before a given one.
+    stops_df.to_csv('data/pit_stop_losses.csv', index=False)
+    team_adj = team_pit_loss_adjustment(stops_df)
     team_adj.to_csv('data/team_pit_loss_adjustment.csv', index=False)
     print(f"\nTeam pit-loss adjustment (negative = faster than field average):")
     print(team_adj.to_string(index=False))
