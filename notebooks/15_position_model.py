@@ -73,6 +73,17 @@ POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
 CLOSE_GAP_S = 2.5          # closer than this at a lap's end counts as racing the car ahead
 FOLLOW_GAP_S = 0.5         # a car that fails to pass sits this far behind (overwritten from data in main)
 N_SIMS = 60
+# Tyre-wear uncertainty: in each simulated race, each of ego's stints wears
+# (1 + WEAR_SD x N(0,1)) times what the tyre model predicts (never less than
+# no wear), drawn independently per stint (a car's error barely carries over
+# between its stints: correlation 0.13). Calibrated so the simulator's
+# 10-90% finishing ranges cover real finishes ~80% of the time (re-racing
+# every finisher's real strategy, 2022-2026): 0 -> 46% (passes alone are
+# far too confident), 0.45 -> 79% (9%/12% below/above), 0.9 -> 87%. The raw
+# spread of observed vs predicted wear over real stints is ~0.9, but that
+# also holds pace management and traffic within a stint.
+WEAR_SD = 0.45
+MAX_STINTS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +196,58 @@ def pass_prob(pm: dict, circuit: str, gap: float, pace_adv: float, age_diff: flo
     x = _design([gap], [pace_adv], [age_diff])[0]
     z = pm['intercept'] + float(x @ pm['coef']) + pm['circuit_effect'].get(circuit, 0.0)
     return 1.0 / (1.0 + math.exp(-z))
+
+
+# ---------------------------------------------------------------------------
+# 1b. How far tyre wear can differ from the tyre model's prediction
+# ---------------------------------------------------------------------------
+
+WEAR_FILE = Path('data/wear_ratios.csv')
+MIN_STINT_LAPS = 10        # clean laps in a stint to measure its wear
+MIN_PRED_WEAR_S = 0.5      # predicted wear over the stint, so the ratio isn't noise
+
+
+def collect_wear_ratios() -> pd.DataFrame:
+    """Per real dry stint: slope of observed relative pace on the tyre
+    model's prediction over the stint's clean laps (1 = wore exactly as
+    predicted; the intercept absorbs the car's own pace), with its standard
+    error. Uses the full tyre model (03), as collect_pass_events does."""
+    silver = pd.read_parquet(dm.SILVER_DIR / 'laps_ml_features.parquet')
+    silver = silver[silver['Compound'].isin(DRY) & (silver['Rainfall'] == 0)]
+    ml_bundle = dm.load_degradation_model()
+    rows = []
+    for race_id, laps in silver.groupby('race'):
+        degradation = dm.build_ml_pace_lookup(race_id, ml_bundle, ['SOFT', 'MEDIUM', 'HARD'])
+        if not degradation:
+            continue
+        for (driver, stint), g in laps.groupby(['Driver', 'Stint']):
+            if len(g) < MIN_STINT_LAPS or g['Compound'].nunique() != 1:
+                continue
+            pred = np.array([rel_at(degradation, c, l, a) for c, l, a in
+                             zip(g['Compound'], g['LapNumber'], g['TyreLife'])], dtype=float)
+            ok = ~np.isnan(pred)
+            x, y = pred[ok], g['RelativePace'].values[ok]
+            if len(x) < MIN_STINT_LAPS or x.max() - x.min() < MIN_PRED_WEAR_S:
+                continue
+            X = np.column_stack([np.ones(len(x)), x])
+            coef, res, *_ = np.linalg.lstsq(X, y, rcond=None)
+            resid = y - X @ coef
+            s2 = resid @ resid / (len(x) - 2)
+            se = math.sqrt(s2 * np.linalg.inv(X.T @ X)[1, 1])
+            rows.append({'race': race_id, 'driver': driver, 'stint': int(stint), 'compound': g['Compound'].iloc[0],
+                         'laps': len(x), 'max_age': float(g['TyreLife'].max()),
+                         'pred_wear_s': float(x.max() - x.min()), 'ratio': float(coef[1]), 'se': se})
+    out = pd.DataFrame(rows)
+    out.to_csv(WEAR_FILE, index=False)
+    return out
+
+
+def wear_sd(ratios: pd.DataFrame) -> float:
+    """Spread of the true wear ratio across stints: the ratios' (robust)
+    variance minus their average sampling variance."""
+    r = ratios['ratio'].clip(-2, 4)
+    mad_sd = 1.4826 * np.median(np.abs(r - r.median()))
+    return float(math.sqrt(max(mad_sd ** 2 - np.median(ratios['se'] ** 2), 0.0)))
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +387,7 @@ class RaceReplay:
         an array indexed by lap."""
         n = self.n_laps
         lap_time, pit_lap, ages = np.full(n + 1, np.nan), np.zeros(n + 1, bool), np.zeros(n + 1)
-        pot_rel = np.full(n + 1, np.nan)
+        pot_rel, wear, stint_of = np.full(n + 1, np.nan), np.zeros(n + 1), np.zeros(n + 1, int)
         stop_set = {int(s) + 1: i + 1 for i, s in enumerate(sorted(stops))}   # out-lap -> stint index
         start_age = self.age.loc[driver, 1] if pd.notna(self.age.loc[driver, 1]) else 1.0
         stint, age, last_p = 0, start_age - 1, -1
@@ -349,10 +412,13 @@ class RaceReplay:
                     lt += (self.neutral['beta'] - 1.0) * deficit
                     deficit *= self.neutral['beta']
             lap_time[lap], ages[lap], pot_rel[lap] = lt, age, offset + rel
-        return lap_time, pit_lap, ages, pot_rel
+            fresh = rel_at(self.degradation, compounds[min(stint, len(compounds) - 1)], lap, 1)
+            wear[lap], stint_of[lap] = (rel - fresh) if fresh is not None else 0.0, min(stint, MAX_STINTS - 1)
+        return lap_time, pit_lap, ages, pot_rel, wear, stint_of
 
     def simulate(self, driver: str, stops: list, compounds: list, pit_loss: float, pm: dict,
-                 rival: str | None = None, n_sims: int = N_SIMS, seed: int = 0, offset: float | None = None) -> dict | None:
+                 rival: str | None = None, n_sims: int = N_SIMS, seed: int = 0, offset: float | None = None,
+                 wear_sd: float | None = None) -> dict | None:
         """Monte Carlo finishing position (and points) of `driver` on the
         candidate strategy, and of `rival` in the same races."""
         if driver not in self.finished or pd.isna(self.T.loc[driver, 1]):
@@ -361,7 +427,7 @@ class RaceReplay:
         pot = self.ego_potential(driver, stops, compounds, pit_loss, offset)
         if pot is None:
             return None
-        lap_time, ego_pit, ego_age, ego_pot_rel = pot
+        lap_time, ego_pit, ego_age, ego_pot_rel, wear, stint_of = pot
         n, S = self.n_laps, n_sims
         others = [d for d in self.drivers if d != driver]
         T = self.T.loc[others].values                       # others' cumulative times
@@ -370,6 +436,13 @@ class RaceReplay:
         pot_o = self.potential().loc[others].values        # others' potential relative pace by lap
         idx = {d: i for i, d in enumerate(others)}
         rng = np.random.default_rng(seed)
+        # Tyre-wear draws first, always the same shape, so every candidate
+        # strategy sees the same draws for its i-th stint (paired comparison).
+        sd = WEAR_SD if wear_sd is None else wear_sd
+        mult = np.maximum(1.0 + sd * rng.standard_normal((S, MAX_STINTS)), 0.0) - 1.0
+        extra = wear[None, :] * mult[:, stint_of]                  # (S, n+1) seconds per lap
+        lap_time = lap_time[None, :] + extra
+        ego_pot_rel = ego_pot_rel[None, :] + extra
         neutral_laps = set(self.neutral['kinds']) if self.neutral else set()
         compress_after = self.neutral['compress_after'] if self.neutral else frozenset()
         ego_laps = int(self.T.loc[driver].notna().sum())    # ego's real distance (lapped stays lapped)
@@ -382,7 +455,7 @@ class RaceReplay:
         C_hist[:, 1] = C
         for lap in range(2, n + 1):
             j = lap - 1                                    # column of this lap
-            prev_C, C_pot = C, C + lap_time[lap]
+            prev_C, C_pot = C, C + lap_time[:, lap]
             Tprev, Tnow = T[:, j - 1][None, :] + delay, T[:, j][None, :] + delay
             on_track = (~np.isnan(T[:, j]) & ~np.isnan(T[:, j - 1]) & ~pit[:, j] & ~pit[:, j - 1])[None, :]
             neutral = lap in neutral_laps or (lap - 1) in neutral_laps
@@ -402,7 +475,7 @@ class RaceReplay:
                     k = np.where(cand, Tprev, -np.inf).argmax(axis=1)
                     rows = np.arange(S)
                     p = np.zeros(S) if neutral else pass_prob_arr(
-                        pm, self.circuit, prev_C - Tprev[rows, k], k_rel[k] - ego_pot_rel[lap], age_gap[k])
+                        pm, self.circuit, prev_C - Tprev[rows, k], k_rel[k] - ego_pot_rel[:, lap], age_gap[k])
                     fail = has & (rng.random(S) >= p)
                     C_pot = np.where(fail, np.maximum(C_pot, Tnow[rows, k] + FOLLOW_GAP_S), C_pot)
                     active &= ~fail
@@ -413,7 +486,7 @@ class RaceReplay:
                 if behind.any():
                     p = np.zeros(behind.shape) if neutral else pass_prob_arr(
                         pm, self.circuit, Tprev - prev_C[:, None],
-                        ego_pot_rel[lap] - k_rel[None, :] + 0 * Tprev, (-age_gap)[None, :] + 0 * Tprev)
+                        ego_pot_rel[:, lap][:, None] - k_rel[None, :], (-age_gap)[None, :] + 0 * Tprev)
                     stuck = behind & (rng.random(behind.shape) >= p)
                     delay += np.where(stuck, C_pot[:, None] + FOLLOW_GAP_S - Tnow, 0.0)
             if lap in compress_after:
@@ -438,6 +511,7 @@ class RaceReplay:
             rival_pos = 1 + ahead_of_r.sum(axis=1) + ego_ahead
             out['rival_exp_position'] = float(rival_pos.mean())
             out['rival_exp_points'] = float(pts(rival_pos).mean())
+            out['rival_positions'] = rival_pos.tolist()
         return out
 
 
@@ -529,10 +603,12 @@ def race_setup(race_id: str, dp_race: pd.DataFrame, ml_bundle: dict, beta: float
     return replays
 
 
-def validate_simulator(events: pd.DataFrame, dp: pd.DataFrame, races: list, n_sims: int = 20) -> pd.DataFrame:
+def validate_simulator(events: pd.DataFrame, dp: pd.DataFrame, races: list, n_sims: int = 20,
+                       wear_sd: float | None = None, quiet: bool = False) -> pd.DataFrame:
     """Simulate every finisher's REAL strategy and compare with where they
     really finished; the pass model for each season is fitted on earlier
-    races only."""
+    races only. Also each real finish's randomized PIT value within the
+    simulated distribution (u: uniform on 0-1 if the spread is right)."""
     ml_bundle = dm.load_degradation_model()
     beta = dpl.sc_gap_compression()
     rows, models = [], {}
@@ -549,22 +625,50 @@ def validate_simulator(events: pd.DataFrame, dp: pd.DataFrame, races: list, n_si
                 continue
             stops, comps = real_strategy(replay, driver)
             offset = replay.pace_offset(driver)
-            sim = replay.simulate(driver, stops, comps, pit_loss, models[season], n_sims=n_sims, offset=offset)
+            sim = replay.simulate(driver, stops, comps, pit_loss, models[season], n_sims=n_sims, offset=offset,
+                                  wear_sd=wear_sd, seed=zlib.crc32(f"{race_id}{driver}".encode()))
             free = replay.simulate(driver, stops, comps, pit_loss, FREE_PASSING, n_sims=1, offset=offset)
             if sim is None or free is None:
                 continue
-            rows.append({'race': race_id, 'driver': driver, 'real_position': replay.real_position.get(driver),
-                         'sim_position': sim['exp_position'], 'free_position': free['exp_position']})
+            real_pos, sims = replay.real_position.get(driver), np.array(sim['positions'])
+            u = np.mean(sims < real_pos) + np.random.default_rng(len(rows)).random() * np.mean(sims == real_pos) \
+                if real_pos is not None else np.nan
+            rows.append({'race': race_id, 'driver': driver, 'real_position': real_pos,
+                         'sim_position': sim['exp_position'], 'free_position': free['exp_position'],
+                         'sim_sd': float(sims.std()), 'pit_u': u})
     out = pd.DataFrame(rows).dropna()
+    if quiet:
+        return out
     for col, label in [('sim_position', 'with overtaking model'), ('free_position', 'race time only (free passing)')]:
         err = (out[col] - out['real_position']).abs()
         rho = out.groupby('race').apply(lambda g: g[col].corr(g['real_position'], method='spearman'), include_groups=False)
         print(f"  {label:32s} position MAE {err.mean():.2f}, within 1 place {(err <= 1).mean():.0%}, "
               f"median per-race Spearman {rho.median():.3f}")
+    print(f"  spread: real finish inside the simulated 10-90% range {pit_coverage(out):.0%} (80% if right), "
+          f"below/above it {(out['pit_u'] < 0.1).mean():.0%}/{(out['pit_u'] > 0.9).mean():.0%}")
     return out
 
 
+def pit_coverage(out: pd.DataFrame) -> float:
+    return float(out['pit_u'].between(0.1, 0.9).mean())
+
+
 RIVAL_WEIGHT = 1.0   # objective = E[points] + RIVAL_WEIGHT x E[points - championship rival's points]
+
+
+def risk_stats(sim: dict) -> dict:
+    """Spread and downside of one strategy's simulated races: SD of
+    finishing position; SD, worst-10% mean (CVaR) and P(no points) of
+    points; SD and worst-10% mean of the objective (points + rival gap,
+    paired draw by draw with the rival's finish)."""
+    pos = np.asarray(sim['positions'])
+    pts = np.array([POINTS.get(int(q), 0) for q in pos], dtype=float)
+    rpts = (np.array([POINTS.get(int(q), 0) for q in sim['rival_positions']], dtype=float)
+            if 'rival_positions' in sim else np.zeros_like(pts))
+    obj = pts + RIVAL_WEIGHT * (pts - rpts)
+    worst = lambda x: float(np.sort(x)[:max(1, len(x) // 10)].mean())
+    return {'sd_position': float(pos.std()), 'sd_points': float(pts.std()), 'cvar10_points': worst(pts),
+            'p_no_points': float((pos > 10).mean()), 'sd_objective': float(obj.std()), 'cvar10_objective': worst(obj)}
 # The position-aware policy: inside a planned stop's window, every stop lap
 # from now to the window's end is raced against the forecast field
 # (forecast_from), and pitting now has to beat the best later lap by
@@ -652,9 +756,13 @@ class StrategyDecider:
     objective. Forecasts shared across the race's cars via `cache`."""
 
     def __init__(self, replay: RaceReplay, driver: str, plan: dict | None, pit_loss: float, neutral: dict | None,
-                 pm: dict, rival: str | None, pit_loss_by_driver: dict, cache: dict):
+                 pm: dict, rival: str | None, pit_loss_by_driver: dict, cache: dict, min_stops: int = 0):
+        """min_stops: never plan fewer stops in total -- e.g. the default
+        plan's count, to keep the policy out of the long stints the tyre
+        model can't price (censoring, see 03)."""
         self.replay, self.driver, self.plan, self.pit_loss, self.neutral = replay, driver, plan, pit_loss, neutral
         self.pm, self.rival, self.pit_loss_by_driver, self.cache = pm, rival, pit_loss_by_driver, cache
+        self.min_stops = min_stops
 
     def forecast(self, lap: int) -> RaceReplay:
         if lap not in self.cache:
@@ -672,6 +780,8 @@ class StrategyDecider:
         seed = zlib.crc32(f"{self.replay.race_id}{self.driver}{lap}".encode())
         values = {}
         for future in candidate_plans(lap, done, comps_so_far, current, self.replay.n_laps):
+            if len(done) + len(future) < self.min_stops and tuple(future) != tuple(sorted(current)):
+                continue
             stops = sorted(done) + list(future)
             comps = choose_compounds(fc.degradation, comps_so_far, stops, self.replay.n_laps)
             if comps is None or len(set(comps)) < 2:
@@ -787,7 +897,8 @@ def position_backtest(events: pd.DataFrame, roll: pd.DataFrame, dp: pd.DataFrame
                                 ('default', parse_strategy(r.get('default_strategy'))),
                                 ('policy', parse_strategy(r.get('policy_strategy'))),
                                 ('policy_pos', parse_strategy(r.get('policy_pos_strategy'))),
-                                ('policy_strat', parse_strategy(r.get('policy_strat_strategy')))]:
+                                ('policy_strat', parse_strategy(r.get('policy_strat_strategy'))),
+                                ('policy_strat_guarded', parse_strategy(r.get('policy_strat_guarded_strategy')))]:
                 if strat is None:
                     continue
                 sim = replay.simulate(r['driver'], strat[0], strat[1], pit_loss, models[season], rival=rival,
@@ -797,16 +908,18 @@ def position_backtest(events: pd.DataFrame, roll: pd.DataFrame, dp: pd.DataFrame
                 row[f'{name}_position'] = sim['exp_position']
                 row[f'{name}_points'] = sim['exp_points']
                 row[f'{name}_rival_points'] = sim.get('rival_exp_points', np.nan)
+                row.update({f'{name}_{k}': v for k, v in risk_stats(sim).items()})
             rows.append(row)
     out = pd.DataFrame(rows)
-    for name in [n for n in ['real', 'default', 'policy', 'policy_pos', 'policy_strat'] if f'{n}_points' in out]:
+    for name in [n for n in ['real', 'default', 'policy', 'policy_pos', 'policy_strat', 'policy_strat_guarded']
+                 if f'{n}_points' in out]:
         out[f'{name}_objective'] = out[f'{name}_points'] + RIVAL_WEIGHT * (
             out[f'{name}_points'] - out[f'{name}_rival_points'].fillna(0))
     return out
 
 
 def report_position_backtest(out: pd.DataFrame, label: str):
-    names = [n for n in ['default', 'policy', 'policy_pos', 'policy_strat'] if f'{n}_points' in out]
+    names = [n for n in ['default', 'policy', 'policy_pos', 'policy_strat', 'policy_strat_guarded'] if f'{n}_points' in out]
     d = out.dropna(subset=['real_points'] + [f'{n}_points' for n in names])
     print(f"\n{label}: {d['race'].nunique()} races, {len(d)} driver-races "
           f"(same random draws for every strategy; mean per driver-race, 95% CI over races)")
@@ -817,6 +930,51 @@ def report_position_backtest(out: pd.DataFrame, label: str):
             m, lo, hi = bootstrap_mean_ci(diff)
             line.append(f"{name} {d[f'{name}_{metric}'].mean():6.2f} (vs real {m:+.2f}, CI {lo:+.2f} to {hi:+.2f})")
         print(' | '.join(line) + f"  [{better} is better]")
+
+
+RISK_LAMBDAS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+
+
+def _paired(d: pd.DataFrame, a: pd.Series, b: pd.Series) -> tuple:
+    return bootstrap_mean_ci((a - b).groupby(d['race']).mean())
+
+
+def risk_report(pos: pd.DataFrame, alt: str = 'policy_strat', base: str = 'real'):
+    """Spread/downside of each strategy, and the risk aversion at which the
+    `base` strategies (the teams' real ones) stop losing to `alt`: value =
+    mean points - lambda x SD of points, per driver-race."""
+    names = [n for n in ['real', 'policy', 'policy_strat_guarded', 'policy_strat'] if f'{n}_sd_points' in pos]
+    d = pos.dropna(subset=[f'{n}_points' for n in names] + [f'{n}_sd_points' for n in names])
+    print(f"\nRisk: {d['race'].nunique()} races, {len(d)} driver-races (mean per driver-race; vs {base}: 95% CI over races)")
+    for metric, label in [('points', 'mean points'), ('sd_points', 'SD of points'), ('cvar10_points', 'worst-10% points'),
+                          ('p_no_points', 'P(no points)'), ('sd_position', 'SD of position'), ('sd_objective', 'SD of objective')]:
+        parts = []
+        for n in names:
+            if n == base:
+                parts.append(f"{n} {d[f'{n}_{metric}'].mean():.2f}")
+            else:
+                m, lo, hi = _paired(d, d[f'{n}_{metric}'], d[f'{base}_{metric}'])
+                parts.append(f"{n} {d[f'{n}_{metric}'].mean():.2f} ({m:+.2f}, {lo:+.2f}..{hi:+.2f})")
+        print(f"  {label:17s} " + ' | '.join(parts))
+
+    def crossing(sub: pd.DataFrame, a: str, b: str) -> str:
+        out = []
+        for lam in RISK_LAMBDAS:
+            va = sub[f'{a}_points'] - lam * sub[f'{a}_sd_points']
+            vb = sub[f'{b}_points'] - lam * sub[f'{b}_sd_points']
+            m, lo, hi = _paired(sub, va, vb)
+            out.append(f"λ={lam:g}: {m:+.2f} ({lo:+.2f}..{hi:+.2f})")
+        return '\n      '.join(out)
+
+    print(f"\nRisk-adjusted value (mean points - λ x SD of points), {alt} minus {base}:\n      {crossing(d, alt, base)}")
+    if 'policy_strat_guarded_points' in d:
+        print(f"\n... {alt} minus policy_strat_guarded (what fewer stops add):\n      {crossing(d, alt, 'policy_strat_guarded')}")
+    champ = pd.read_csv('data/championship_rivals.csv')
+    champ['rank'] = champ.groupby('race')['drivers_champ_points_before'].rank(ascending=False, method='min')
+    d = d.merge(champ[['race', 'driver', 'rank', 'rival_driver_points_gap']], on=['race', 'driver'], how='left')
+    fight = d['rank'] <= 3
+    for label, sub in [('championship top 3 before the race', d[fight]), ('everyone else', d[~fight])]:
+        print(f"\n{label}: {len(sub)} driver-races\n      {crossing(sub, alt, base)}")
 
 
 def main():
@@ -840,6 +998,7 @@ def main():
     print(f"\nObjective = expected points + {RIVAL_WEIGHT:g} x expected points gap to the championship rival")
     report_position_backtest(pos, "Position-scored backtest, all rolling races")
     report_position_backtest(pos[~pos['race_had_sc']], "Races with no SC/VSC")
+    risk_report(pos)
 
 
 if __name__ == '__main__':

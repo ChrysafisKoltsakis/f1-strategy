@@ -60,6 +60,9 @@ _spec5.loader.exec_module(pos)
 # ~1 hour more over the rolling races). Scored in 15's position backtest.
 POSITION_POLICY = '--position' in sys.argv
 # --strategy: also replay the strategy-level policy (15's StrategyDecider).
+# --strategy-guarded: the same, never planning fewer stops than the default
+# plan (policy_strat_guarded_strategy). Either flag or both.
+STRATEGY_GUARDED = '--strategy-guarded' in sys.argv
 STRATEGY_POLICY = '--strategy' in sys.argv
 
 BRONZE_DIR = Path('data/bronze')
@@ -404,7 +407,7 @@ def run_backtest(pred: pd.DataFrame, dp: pd.DataFrame, deg_df: pd.DataFrame, ml_
     beta = dpl.sc_gap_compression()
     rows = []
     zero_stop_drivers = 0
-    if POSITION_POLICY or STRATEGY_POLICY:
+    if POSITION_POLICY or STRATEGY_POLICY or STRATEGY_GUARDED:
         pass_events = pd.read_csv(pos.EVENTS_FILE)
         pos.FOLLOW_GAP_S = pos.follow_gap(pass_events)
         pass_models = {}
@@ -438,7 +441,7 @@ def run_backtest(pred: pd.DataFrame, dp: pd.DataFrame, deg_df: pd.DataFrame, ml_
                                                  int(laps['LapNumber'].max()))
         beta_as_of = dpl.sc_gap_compression(before_race=race_id)
         decision_models = {}
-        if POSITION_POLICY or STRATEGY_POLICY:
+        if POSITION_POLICY or STRATEGY_POLICY or STRATEGY_GUARDED:
             season = race_id[:4]
             if season not in pass_models:
                 pass_models[season] = pos.fit_pass_model(pass_events, before_race=f"{season}_r00")
@@ -516,7 +519,7 @@ def run_backtest(pred: pd.DataFrame, dp: pd.DataFrame, deg_df: pd.DataFrame, ml_
                 return ';'.join(map(str, sorted(stop_laps))) + '|' + ';'.join(trace)
 
             policy_s = policy_sc_s = policy_n = policy_strategy = default_strategy = policy_pos_strategy = None
-            policy_strat_strategy = None
+            policy_strat_strategy = policy_strat_guarded_strategy = None
             if plan is not None and start_compound in degradation:
                 prices = {'SC': float(dp_row['team_sc_pit_loss_s']), 'VSC': float(dp_row['team_vsc_pit_loss_s'])}
                 key = (n_laps, pit_loss, prices['SC'], prices['VSC'])
@@ -541,11 +544,18 @@ def run_backtest(pred: pd.DataFrame, dp: pd.DataFrame, deg_df: pd.DataFrame, ml_
                     policy_pos_laps = follow_default_policy(plan, start_compound, n_laps, field_pace, degradation,
                                                             pit_loss, neutral, decide, green_value=decider)
                     policy_pos_strategy = strategy_str(policy_pos_laps)
-                if STRATEGY_POLICY and pos_replay.ok:
+                for run, min_stops in [(STRATEGY_POLICY, 0), (STRATEGY_GUARDED, len(plan['stops']))]:
+                    if not (run and pos_replay.ok):
+                        continue
                     sdecider = pos.StrategyDecider(pos_replay, driver, plan, pit_loss, neutral, pass_models[race_id[:4]],
-                                                   rivals_here.get(driver), pit_loss_by_driver, forecast_cache)
-                    policy_strat_strategy = strategy_str(follow_strategy_policy(
+                                                   rivals_here.get(driver), pit_loss_by_driver, forecast_cache,
+                                                   min_stops=min_stops)
+                    s = strategy_str(follow_strategy_policy(
                         plan, start_compound, n_laps, field_pace, degradation, pit_loss, neutral, decide, sdecider))
+                    if min_stops:
+                        policy_strat_guarded_strategy = s
+                    else:
+                        policy_strat_strategy = s
                 policy_strategy = strategy_str(policy_laps)
                 default_strategy = strategy_str([l for l in plan['stops'] if 2 < l < n_laps - 1])
 
@@ -556,6 +566,7 @@ def run_backtest(pred: pd.DataFrame, dp: pd.DataFrame, deg_df: pd.DataFrame, ml_
                 'policy_s': policy_s, 'policy_n_stops': policy_n,
                 'policy_strategy': policy_strategy, 'default_strategy': default_strategy,
                 'policy_pos_strategy': policy_pos_strategy, 'policy_strat_strategy': policy_strat_strategy,
+                'policy_strat_guarded_strategy': policy_strat_guarded_strategy,
                 'policy_delta_vs_optimal': (policy_s - dp_row['dp_optimal_s']) if policy_s else None,
                 'policy_sc_s': policy_sc_s,
                 'policy_sc_delta_vs_optimal': (policy_sc_s - dp_row['dp_optimal_s']) if policy_sc_s else None,
