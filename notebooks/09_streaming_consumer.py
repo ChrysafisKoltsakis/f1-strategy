@@ -87,7 +87,7 @@ LIVE_EVENTS_DIR = Path('data/live_events')
 #   'strategy' -- 15's StrategyDecider: re-plan the whole rest of the race
 #                 (stop count and timing) with the position model
 # See the README's position-model section for how each scores offline.
-STRATEGY_MODE = 'window'   # 'strategy' is built but its offline evaluation is pending
+STRATEGY_MODE = 'strategy'   # supported offline (README, docs/forward_test.md); 'window' is the conservative alternative
 
 # Load 05_trigger_classifier.py's feature-building functions directly, so
 # live and offline feature computation can never drift apart.
