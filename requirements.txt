@@ -1,4 +1,4 @@
-fastf1>=3.8.3
+fastf1>=3.9.1
 pandas>=2.3.3
 numpy>=2.5.2
 matplotlib>=3.11.1

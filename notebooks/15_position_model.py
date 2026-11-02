@@ -272,7 +272,13 @@ class RaceReplay:
         if not self.ok:
             return
         self.n_laps = int(n_laps or laps['LapNumber'].max())
-        self.field = laps.groupby('LapNumber')['lt'].median().reindex(range(1, self.n_laps + 1))
+        # The field's clock time per lap (median over cars of the change in
+        # session time), not its median lap time: under a red flag the
+        # stoppage is in the session time but not in any lap time, so a car
+        # timed by lap times alone would skip it and finish far ahead of a
+        # field timed by the clock (2026 Mexico City: a 55-minute stoppage).
+        dt = laps.sort_values('LapNumber').groupby('Driver')['t'].diff().fillna(laps['lt'])
+        self.field = dt.groupby(laps['LapNumber']).median().reindex(range(1, self.n_laps + 1))
         self.drivers = sorted(laps['Driver'].unique())
         self.T = laps.pivot_table(index='Driver', columns='LapNumber', values='t').reindex(
             index=self.drivers, columns=range(1, self.n_laps + 1))

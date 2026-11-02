@@ -36,3 +36,24 @@ For each new race and pooled, against the teams' real strategies (all re-raced t
 Development-set reference (2022–2026_r16, 1215 driver-races): strategy policy +1.10 points per driver-race vs the teams (CI 0.82–1.41), guarded +0.47, time-based +0.47.
 
 With 3–7 races the test can confirm or flag the development result, not establish it on its own; results are reported whichever way they go.
+
+## Results: 2026_r17–r19 (scored 2026-11-02, after the red-flag fix)
+
+50 driver-races in 3 races. Mean per driver-race vs the teams' real strategies, all re-raced through the same simulator with the same random draws. The 95% CIs are a bootstrap over only 3 races, so treat them as rough.
+
+| Strategy | Points vs real | Places vs real |
+|---|---|---|
+| Default plan (Pirelli) | +0.37 (−0.19 to +0.83) | −0.13 |
+| Time-based live policy | +0.74 (+0.49 to +0.91) | −0.47 |
+| Position-aware window policy | +0.74 (+0.43 to +0.95) | −0.48 |
+| Strategy policy (unguarded = guarded here) | **+0.82 (+0.40 to +1.06)** | −0.56 |
+
+- **Per race, strategy policy, points per driver vs real:** Singapore +0.40, United States +1.01, Mexico City +1.05. All three go the same way.
+- **Risk:** points SD +0.10 vs real (CI −0.03 to +0.23), worst-10% points +0.35, P(no points) −2 pp. Still ahead at λ = 3 (+0.53).
+- **What this does not test:** Pirelli's plan was a one-stop in all three races, so the strategy policy never had a stop it could cut. Guarded and unguarded are identical, and in Mexico City it *added* stops (3 stops for 14 of 17 cars). The forward test confirms the policy's timing and SC/VSC side on unseen races. The development finding that its extra value comes from fewer stops is not tested here.
+- **Development reference after the red-flag fix (2022–2026_r16, 1215 driver-races):** strategy policy +1.03 points (CI 0.78–1.31), guarded +0.43, time-based +0.40. Simulator coverage of real finishes at `WEAR_SD = 0.45`: 79% (11%/10% below/above).
+
+## Deviations log
+
+- **2026-11-02: FastF1 3.8.3 → 3.9.1 in `.venv`.** Needed to sign in to F1's live-timing archive, which has required an F1 TV login since ~15 Oct 2026. The races before 2026_r17 were parsed with 3.8.3, the forward-test races with 3.9.1. No model, setting or code in 02–15 changed.
+- **2026-11-02: red-flag bug fixed in 15's simulator.** The first forward-test scoring put every driver 1st in Mexico City (2026_r19). The race had a red flag on laps 44–45, about 55 minutes stopped. The simulated car was timed from the field's median *lap time*, which excludes the stoppage, while the other cars' session times include it, so it "won" by about 2,200 s. The field is now timed by its median change in session time per lap. Races without a red flag move by under 1 s in total (Canada 2023: 0.9 s on one SC lap; Spain 2024: 0). Three development races in the backtest set had red flags (2023_r20, 2024_r08, 2026_r06; validation error there 4.76 places before the fix). Their policy decisions and the full development scoring were re-run with the fix, so the development reference above is updated below. No setting changed; `WEAR_SD` stays 0.45.
