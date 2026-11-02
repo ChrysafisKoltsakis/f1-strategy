@@ -22,6 +22,11 @@
 #   2026_r10  windows from F1's strategy charts as reproduced by Formula Live Pulse
 #   2026_r11  Pirelli rated one- and two-stop level on time; the one-stop is used
 #   2026_r14  Madrid debut; Pirelli said Medium-Hard one-stop but gave no window
+# Forward-test races, collected 2026-11-02, before their race data was pulled:
+#   2026_r17  most sources give Soft-Medium 26-32 as Pirelli's primary plan; one
+#             outlet says Medium-Soft 28-34 is preferred
+#   2026_r18  Pirelli named Medium-Hard and Soft-Hard one-stops as favourites
+#             (Medium-Hard first), no windows given
 race,compounds,stop_windows,source
 2025_r20,MEDIUM-SOFT,42-48,https://www.pitpass.com/81424/Mexico-City-Grand-Prix-Qualifying-team-notes-Pirelli
 2025_r21,SOFT-MEDIUM,24-30,https://www.pitpass.com/81513/Sao-Paulo-Grand-Prix-Sprint-Qualifying-team-notes-Pirelli
@@ -41,3 +46,6 @@ race,compounds,stop_windows,source
 2026_r13,MEDIUM-HARD,24-30,https://www.f1technical.net/news/29271
 2026_r14,MEDIUM-HARD,,https://www.autosport.com/f1/news/spanish-gp-strategy-options-in-madrid/10855301/
 2026_r15,MEDIUM-SOFT,26-32,https://www.autohebdof1.com/news/f1/What-are-the-possible-strategies-for-the-Azerbaijan-GP.html
+2026_r17,SOFT-MEDIUM,26-32,https://www.autohebdof1.com/news/f1/What-strategy-for-the-2026-Singapore-Grand-Prix.html
+2026_r18,MEDIUM-HARD,,https://scuderiafans.com/f1-united-states-gp-tyre-strategy-pirelli-reveals-one-stop-favourites-and-two-stop-alternative/
+2026_r19,MEDIUM-SOFT,35-41,https://scuderiafans.com/2026-mexico-gp-tyre-strategy-pirelli-chooses-softest-compounds-as-new-asphalt-adds-uncertainty/
