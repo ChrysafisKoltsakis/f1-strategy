@@ -51,6 +51,19 @@ Older data helps most early in 2022 and fades as the season goes on; *k* = 10 is
 
 The thesis test set is pinned to races from 2025 round 20 on (`TEST_FROM_RACE` in 05), so adding seasons or new 2026 rounds doesn't change what the evaluation is scored on.
 
+## Quick start (day-to-day)
+
+Everything below is run from the project folder. **Docker is only needed for the Kafka broker** behind the live replay and dashboard; the backtests, models and notebooks don't use it. Start Docker Desktop (with WSL integration) first if you want the dashboard.
+
+```bash
+scripts/dashboard.sh              # starts Kafka (Docker) + the dashboard -> open http://localhost:8000, pick a race, click Start
+scripts/replay.sh 2023_r08 150    # same live replay without the browser: events in data/live_events/<race>.jsonl
+scripts/kafka.sh start|stop|status   # the broker on its own (container f1-kafka, created on first use)
+scripts/rebuild.sh                # regenerate data/ and models in the right order (add --policies for the slow position-aware runs)
+```
+
+`scripts/rebuild.sh` skips the tyre model (03) when one already exists, because it is frozen for the forward test (`docs/forward_test.md`); pass `--retrain-tyre` to override. Needs the Java in `~/.local/jdk` (see Streaming layer below) and, for races after 2026 round 16, the F1 TV login (see Rebuilding and running).
+
 ## Setup
 
 ```bash
