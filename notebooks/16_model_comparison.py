@@ -4,7 +4,8 @@ learned components (03's tyre model, 05's pit classifier). This asks whether
 that choice matters: the same data, folds and metrics for a few different
 model families, then each alternative pushed through the backtest.
 
-  tyre        leave-one-circuit-out MAE (03's evaluation) for each tyre model
+  tyre        leave-one-circuit-out MAE (03's evaluation) for each tyre model;
+              with --cv 5, grouped 5-fold by circuit instead
   classifier  rolling-origin evaluation (05's, each season predicted from
               earlier races only) for each pit classifier
   downstream  each alternative swapped into 06's time-scored rolling backtest:
@@ -19,7 +20,8 @@ the same model), so they are comparable across models; the "vs optimal"
 columns are not, because 04's hindsight optimum is always priced by the
 deployed LightGBM.
 
-Run with: python notebooks/16_model_comparison.py [tyre|classifier|downstream|all]
+Run with: python notebooks/16_model_comparison.py [tyre [--cv 5]|classifier|downstream|rescore|all]
+(rescore recomputes the classifier and downstream summaries from the saved files.)
 """
 import sys
 import importlib.util
@@ -34,6 +36,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import average_precision_score, brier_score_loss, f1_score, mean_absolute_error
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, OrdinalEncoder, StandardScaler
 
@@ -51,7 +54,11 @@ cl = _load('trigger_classifier_lib', '05_trigger_classifier.py')
 OUT_DIR = Path('data/model_comparison')
 SILVER_FILE = Path('data/silver/laps_ml_features.parquet')
 N_BOOTSTRAP = 1000
+KFOLD_REPEATS = 3
 DEPLOYED = 'LightGBM (deployed)'
+# Forward-test races (docs/forward_test.md) stay out of every comparison here:
+# choosing a model from them would spend the only truly unseen races.
+HOLDOUT_FROM = '2026_r17'
 
 
 class Est:
@@ -153,10 +160,21 @@ def compare_tyre_models():
 
     wide = folds.pivot(index='circuit', columns='model', values='mae')
     n = folds.drop_duplicates('circuit').set_index('circuit')['n'].reindex(wide.index).to_numpy()
+    res = _circuit_summary(wide, n, cands)
+    res.to_csv(OUT_DIR / 'tyre_summary.csv', index=False)
+    print(f"\n=== Tyre models, leave-one-circuit-out over {len(wide)} circuits (MAE of relative pace, "
+          f"95% CI resampling circuits) ===")
+    print(res.round(3).to_string(index=False))
+    return res
+
+
+def _circuit_summary(wide: pd.DataFrame, n: np.ndarray, names) -> pd.DataFrame:
+    """Lap-weighted MAE per model from a circuit x model table, with 95% CIs
+    from resampling whole circuits and the paired difference vs. deployed."""
     rng = np.random.default_rng(0)
-    draws = rng.integers(0, len(wide), (N_BOOTSTRAP, len(wide)))   # resample whole circuits
+    draws = rng.integers(0, len(wide), (N_BOOTSTRAP, len(wide)))
     rows = []
-    for name in cands:
+    for name in names:
         m = wide[name].to_numpy()
         boot = [np.average(m[d], weights=n[d]) for d in draws]
         diff = [np.average((m - wide[DEPLOYED].to_numpy())[d], weights=n[d]) for d in draws]
@@ -165,11 +183,64 @@ def compare_tyre_models():
                      'vs_deployed_s': np.average(m - wide[DEPLOYED].to_numpy(), weights=n),
                      'vs_deployed_ci_low': bootstrap_ci(diff)[0], 'vs_deployed_ci_high': bootstrap_ci(diff)[1],
                      'circuits_better_than_deployed': int((m < wide[DEPLOYED].to_numpy()).sum())})
-    res = pd.DataFrame(rows)
-    res.to_csv(OUT_DIR / 'tyre_summary.csv', index=False)
-    print(f"\n=== Tyre models, leave-one-circuit-out over {len(wide)} circuits (MAE of relative pace, "
-          f"95% CI resampling circuits) ===")
+    return pd.DataFrame(rows)
+
+
+def compare_tyre_models_kfold(k: int = 5):
+    """Grouped k-fold: whole circuits are held out together, never laps of a
+    circuit split across train and test, so this asks the same question as
+    leave-one-circuit-out at a fraction of the fits, with less training data
+    per fold. Repeated with KFOLD_REPEATS different assignments of circuits to
+    folds, because one assignment can be lucky. Per-circuit errors are averaged
+    over the repeats, then summarised exactly like leave-one-circuit-out, so
+    the two can be compared directly."""
+    silver = load_silver()
+    cols = dm.FEATURE_COLS
+    cands = tyre_candidates()
+    rows = []
+    for repeat in range(KFOLD_REPEATS):
+        splitter = GroupKFold(n_splits=k, shuffle=True, random_state=repeat)
+        for fold, (tr, te) in enumerate(splitter.split(silver, groups=silver['Circuit'].astype(str))):
+            train, test = silver.iloc[tr], silver.iloc[te]
+            w = dm.era_weights(train['race'])
+            maes = []
+            for name, make in cands.items():
+                pred = make().fit(train[cols], train['RelativePace'], w).predict(test[cols])
+                err = pd.Series(np.abs(test['RelativePace'].to_numpy() - pred), index=test.index)
+                for circuit, e in err.groupby(test['Circuit'].astype(str)):
+                    rows.append({'model': name, 'repeat': repeat, 'fold': fold, 'circuit': circuit,
+                                 'n': len(e), 'mae': e.mean()})
+                maes.append(err.mean())
+            print(f"  repeat {repeat} fold {fold} ({test['Circuit'].nunique()} circuits, {len(test)} laps) "
+                  + '  '.join(f"{m:.3f}" for m in maes), flush=True)
+    folds = pd.DataFrame(rows)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    folds.to_csv(OUT_DIR / f'tyre_cv{k}_circuits.csv', index=False)
+
+    wide = folds.groupby(['circuit', 'model'])['mae'].mean().unstack()
+    n = folds.drop_duplicates(['circuit']).set_index('circuit')['n'].reindex(wide.index).to_numpy()
+    res = _circuit_summary(wide, n, cands)
+    by_fold = folds.groupby(['model', 'repeat', 'fold']).apply(
+        lambda g: np.average(g['mae'], weights=g['n']), include_groups=False)
+    spread = by_fold.groupby('model').agg(['std', 'min', 'max'])
+    by_repeat = folds.groupby(['model', 'repeat']).apply(
+        lambda g: np.average(g['mae'], weights=g['n']), include_groups=False).unstack()
+    for col, s in {'fold_sd': spread['std'], 'fold_min': spread['min'], 'fold_max': spread['max'],
+                   'repeat_range': by_repeat.max(axis=1) - by_repeat.min(axis=1)}.items():
+        res[col] = res['model'].map(s)
+    res.to_csv(OUT_DIR / f'tyre_cv{k}_summary.csv', index=False)
+    print(f"\n=== Tyre models, grouped {k}-fold by circuit, {KFOLD_REPEATS} repeats over {len(wide)} circuits "
+          f"(MAE of relative pace, 95% CI resampling circuits) ===")
     print(res.round(3).to_string(index=False))
+
+    loco = OUT_DIR / 'tyre_summary.csv'
+    if loco.exists():
+        both = res.set_index('model')[['mae_s', 'vs_deployed_s']].join(
+            pd.read_csv(loco).set_index('model')[['mae_s', 'vs_deployed_s']], rsuffix='_loco')
+        print(f"\n{k}-fold vs. leave-one-circuit-out:")
+        print(both.round(3).to_string())
+        print(f"Spearman rank correlation of the models' MAE: "
+              f"{both['mae_s'].corr(both['mae_s_loco'], method='spearman'):.2f}")
     return res
 
 
@@ -284,16 +355,24 @@ def _slug(name: str) -> str:
     return ''.join(c if c.isalnum() else '_' for c in name.lower()).strip('_')
 
 
+def _clf_pred_file(name: str) -> Path:
+    return OUT_DIR / f'classifier_{_slug(name)}_rolling_predictions.csv'
+
+
 def compare_classifiers():
     df = classifier_frame()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    preds = {}
     for name, make in classifier_candidates().items():
         print(f"  rolling-origin: {name}", flush=True)
-        preds[name] = rolling_predictions(df, name, make)
-        preds[name].to_csv(OUT_DIR / f'classifier_{_slug(name)}_rolling_predictions.csv', index=False)
+        rolling_predictions(df, name, make).to_csv(_clf_pred_file(name), index=False)
+    return summarise_classifiers()
 
-    base = preds[DEPLOYED].reset_index(drop=True)
+
+def summarise_classifiers():
+    """Scores the saved rolling-origin predictions, forward-test races left out."""
+    preds = {name: pd.read_csv(_clf_pred_file(name)) for name in classifier_candidates()}
+    preds = {name: p[p['race'] < HOLDOUT_FROM].reset_index(drop=True) for name, p in preds.items()}
+    base = preds[DEPLOYED]
     races = base['race'].to_numpy()
     uniq = np.unique(races)
     idx = {r: np.flatnonzero(races == r) for r in uniq}
@@ -319,7 +398,7 @@ def compare_classifiers():
                      'mean_P': proba.mean(), 'pit_rate': y.mean()})
     res = pd.DataFrame(rows)
     res.to_csv(OUT_DIR / 'classifier_summary.csv', index=False)
-    print(f"\n=== Pit classifiers, rolling-origin 2022-2026 ({len(uniq)} races, {len(y)} laps; "
+    print(f"\n=== Pit classifiers, rolling-origin {uniq[0]} to {uniq[-1]} ({len(uniq)} races, {len(y)} laps; "
           f"95% CI resampling races) ===")
     print(res.round(4).to_string(index=False))
     per_season = pd.concat([p.assign(model=n) for n, p in preds.items()]).groupby(['model', 'season']).apply(
@@ -336,25 +415,22 @@ KEEP = ['Real teams', 'Classifier, threshold', 'Classifier, multi-stop ranking',
         'Default plan (pre-race)', 'Live policy (default + SC/VSC)']
 
 
+def _backtest_file(kind: str, name: str) -> Path:
+    return OUT_DIR / f'backtest_{kind}_{_slug(name)}.csv'
+
+
 def downstream():
     bt = _load('backtest_lib', '06_backtest_evaluation.py')
     dp = pd.read_csv('data/dp_baseline_backtest.csv')
     deg_df = pd.read_csv('data/degradation_summary.csv')
     deployed_pred = pd.read_csv('data/trigger_classifier_rolling_predictions.csv')
-    rows = []
 
     def run(kind, name, pred, bundle):
-        out = bt.run_backtest(pred, dp, deg_df, bundle)
+        # Forward-test races are dropped before replaying, not just before scoring.
+        out = bt.run_backtest(pred[pred['race'] < HOLDOUT_FROM], dp, deg_df, bundle)
         out['season'] = out['race'].str[:4].astype(int)
-        out.to_csv(OUT_DIR / f'backtest_{kind}_{_slug(name)}.csv', index=False)
-        table = bt.bootstrap_medians(out)
-        table.insert(0, 'model', name)
-        table.insert(0, 'varied', kind)
-        table['races'] = out['race'].nunique()
-        rows.append(table[table['strategy'].isin(KEEP)])
-        pd.concat(rows).to_csv(OUT_DIR / 'downstream_summary.csv', index=False)
-        print(f"\n[{kind}] {name}: {out['race'].nunique()} races, {len(out)} driver-races")
-        print(table[table['strategy'].isin(KEEP)].drop(columns=['varied']).round(2).to_string(index=False), flush=True)
+        out.to_csv(_backtest_file(kind, name), index=False)
+        print(f"  [{kind}] {name}: {out['race'].nunique()} races, {len(out)} driver-races", flush=True)
 
     print("=== Downstream: tyre model varied (deployed classifier's predictions) ===")
     for name, bundle in fit_tyre_bundles().items():
@@ -364,21 +440,49 @@ def downstream():
     deployed_bundle = joblib.load('data/models/degradation_model.joblib')
     print("\n=== Downstream: pit classifier varied (deployed tyre model) ===")
     for name in classifier_candidates():
-        f = OUT_DIR / f'classifier_{_slug(name)}_rolling_predictions.csv'
-        if not f.exists():
+        if not _clf_pred_file(name).exists():
             print(f"  {name}: run the classifier stage first")
             continue
-        run('classifier', name, pd.read_csv(f), deployed_bundle)
+        run('classifier', name, pd.read_csv(_clf_pred_file(name)), deployed_bundle)
+    return summarise_downstream(bt)
+
+
+def summarise_downstream(bt=None):
+    """Bootstraps the saved backtests (06's bootstrap_medians), forward-test races left out."""
+    bt = bt or _load('backtest_lib', '06_backtest_evaluation.py')
+    rows = []
+    for kind, names in [('tyre', tyre_candidates()), ('classifier', classifier_candidates())]:
+        for name in names:
+            if not _backtest_file(kind, name).exists():
+                continue
+            out = pd.read_csv(_backtest_file(kind, name))
+            out = out[out['race'] < HOLDOUT_FROM]
+            table = bt.bootstrap_medians(out)
+            table = table[table['strategy'].isin(KEEP)]
+            table.insert(0, 'model', name)
+            table.insert(0, 'varied', kind)
+            table['races'] = out['race'].nunique()
+            rows.append(table)
+            print(f"\n[{kind}] {name}: {out['race'].nunique()} races, {len(out)} driver-races")
+            print(table.drop(columns=['varied']).round(2).to_string(index=False), flush=True)
+    res = pd.concat(rows, ignore_index=True)
+    res.to_csv(OUT_DIR / 'downstream_summary.csv', index=False)
+    return res
 
 
 def main():
     stage = sys.argv[1] if len(sys.argv) > 1 else 'all'
-    if stage in ('tyre', 'all'):
+    if '--cv' in sys.argv:
+        compare_tyre_models_kfold(int(sys.argv[sys.argv.index('--cv') + 1]))
+    elif stage in ('tyre', 'all'):
         compare_tyre_models()
     if stage in ('classifier', 'all'):
         compare_classifiers()
     if stage in ('downstream', 'all'):
         downstream()
+    if stage == 'rescore':   # summaries again from the saved predictions and backtests, no refitting
+        summarise_classifiers()
+        summarise_downstream()
 
 
 if __name__ == '__main__':

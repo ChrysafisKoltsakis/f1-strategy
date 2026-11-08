@@ -267,6 +267,46 @@ def comparison_tyre():
     save(fig, 'comparison_tyre_mae.png')
 
 
+def comparison_tyre_cv(k=5):
+    """Grouped k-fold against leave-one-circuit-out, on the same models and metric."""
+    loco, cv = read(CMP / 'tyre_summary.csv'), read(CMP / f'tyre_cv{k}_summary.csv')
+    circuits = read(CMP / f'tyre_cv{k}_circuits.csv')
+    if loco is None or cv is None or circuits is None:
+        return
+    loco = loco.sort_values('mae_s').set_index('model')
+    cv = cv.set_index('model').reindex(loco.index)
+    y = np.arange(len(loco))[::-1]
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.8), sharey=True)
+
+    for off, d, color, label in [(0.14, loco, GREY, 'Leave-one-circuit-out'), (-0.14, cv, BLUE, f'Grouped {k}-fold')]:
+        axes[0].hlines(y + off, d['mae_ci_low'], d['mae_ci_high'], color=color, lw=2)
+        axes[0].scatter(d['mae_s'], y + off, color=color, s=36, zorder=3, edgecolor='white', linewidth=1, label=label)
+        axes[1].hlines(y + off, d['vs_deployed_ci_low'], d['vs_deployed_ci_high'], color=color, lw=2)
+        axes[1].scatter(d['vs_deployed_s'], y + off, color=color, s=36, zorder=3, edgecolor='white', linewidth=1)
+    axes[0].set_yticks(y, list(loco.index))
+    axes[0].set_xlabel('MAE of relative pace (s); 95% CI over circuits')
+    axes[0].set_title('Held-out error')
+    fig.legend(*axes[0].get_legend_handles_labels(), frameon=False, fontsize=9, loc='upper center', ncol=2,
+               bbox_to_anchor=(0.5, 1.07))
+    axes[1].axvline(0, color=MUTED, lw=0.8)
+    axes[1].set_xlabel('MAE vs. deployed (s); negative = better')
+    axes[1].set_title('Paired against deployed')
+    axes[1].xaxis.set_major_locator(plt.MultipleLocator(0.01))
+
+    by_fold = circuits.groupby(['model', 'repeat', 'fold']).apply(
+        lambda g: np.average(g['mae'], weights=g['n']), include_groups=False).rename('mae').reset_index()
+    rng = np.random.default_rng(0)
+    for model, yy in zip(loco.index, y):
+        s = by_fold[by_fold['model'] == model]['mae']
+        axes[2].scatter(s, yy + rng.uniform(-0.16, 0.16, len(s)), color=BLUE, s=20, alpha=0.65, edgecolor='white',
+                        linewidth=0.5)
+    axes[2].set_xlabel(f'MAE of each fold (s), {by_fold["repeat"].nunique()} repeats of {k} folds')
+    axes[2].set_title('Fold-to-fold spread')
+    for ax in axes:
+        ax.grid(axis='y', visible=False)
+    save(fig, f'comparison_tyre_cv{k}.png')
+
+
 def comparison_classifier():
     d = read(CMP / 'classifier_summary.csv')
     if d is None:
@@ -277,7 +317,7 @@ def comparison_classifier():
     forest(axes[0], list(d['model']), d['avg_precision'], d['ap_ci_low'], d['ap_ci_high'], colors, zero=False)
     axes[0].set_xlabel('Average precision, rolling-origin 2022-26 (95% CI over races)')
     axes[0].set_title('Ranking pit laps')
-    axes[1].barh(range(len(d)), d['calibration_error'], color=colors, height=0.5)
+    axes[1].barh(np.arange(len(d))[::-1], d['calibration_error'], color=colors, height=0.5)
     axes[1].set_yticks([])
     axes[1].set_xlabel('Calibration error (lower = probabilities mean what they say)')
     axes[1].set_title('Calibration'); axes[1].grid(axis='y', visible=False)
@@ -288,28 +328,32 @@ def comparison_downstream():
     d = read(CMP / 'downstream_summary.csv')
     if d is None:
         return
-    panels = [('tyre', 'Default plan (pre-race)', 'Tyre model swapped: default plan vs. the teams'),
-              ('tyre', 'Live policy (default + SC/VSC)', 'Tyre model swapped: live policy vs. the teams'),
-              ('classifier', 'Classifier, multi-stop ranking', 'Classifier swapped: multi-stop ranking vs. the teams')]
-    panels = [p for p in panels if not d[(d['varied'] == p[0]) & (d['strategy'] == p[1])].empty]
-    if not panels:
-        return
-    fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 3.4))
-    axes = np.atleast_1d(axes)
-    for ax, (kind, strat, title) in zip(axes, panels):
-        s = d[(d['varied'] == kind) & (d['strategy'] == strat)]
-        colors = [BLUE if m.startswith('LightGBM (dep') else GREY for m in s['model']]
-        forest(ax, _short(list(s['model'])), s['vs_real_median_diff_s'], s['diff_ci_low'], s['diff_ci_high'], colors)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel('Median seconds vs. the real strategy')
-    save(fig, 'comparison_downstream.png')
+    # One figure per thing swapped; panels in a figure share the model rows.
+    for kind, strategies, name in [
+            ('tyre', ['Default plan (pre-race)', 'Live policy (default + SC/VSC)'], 'comparison_downstream_tyre.png'),
+            ('classifier', ['Classifier, threshold', 'Classifier, multi-stop ranking'],
+             'comparison_downstream_classifier.png')]:
+        k = d[d['varied'] == kind]
+        if k.empty:
+            continue
+        order = list(dict.fromkeys(k['model']))
+        fig, axes = plt.subplots(1, len(strategies), figsize=(11, 3.6), sharey=True)
+        for ax, strat in zip(axes, strategies):
+            s = k[k['strategy'] == strat].set_index('model').reindex(order)
+            colors = [BLUE if m.startswith('LightGBM (dep') else GREY for m in order]
+            forest(ax, order, s['vs_real_median_diff_s'], s['diff_ci_low'], s['diff_ci_high'], colors)
+            ax.set_title(strat)
+            ax.set_xlabel('Median seconds vs. the teams; negative = faster')
+        fig.suptitle(f"{'Tyre model' if kind == 'tyre' else 'Pit classifier'} swapped, rolling backtest "
+                     f"({int(k['races'].iloc[0])} races)", x=0.01, ha='left', fontsize=11, fontweight='bold', y=1.04)
+        save(fig, name)
 
 
 def main():
     print("Writing figures to docs/figures/")
     for f in [tyre_degradation, pit_loss, classifier_diagnostics, backtest_time, backtest_points,
               position_validation, overtaking, strategy_cost_validation,
-              comparison_tyre, comparison_classifier, comparison_downstream]:
+              comparison_tyre, comparison_tyre_cv, comparison_classifier, comparison_downstream]:
         try:
             f()
         except Exception as e:   # one broken figure shouldn't stop the rest
